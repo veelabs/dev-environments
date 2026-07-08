@@ -1,5 +1,8 @@
 {{- if .Values.landing.enabled }}
-# Landing page: the public "claim a devbox" front door at https://<baseDomain>.
+# Landing page: the public "claim a devbox" front door at
+# https://<landing.subdomain>.<baseDomain>. The subdomain is covered by the
+# same wildcard *.<baseDomain> edge route as the environments, and can never
+# collide with them (env hostnames always carry the oc- prefix plus a name).
 # Serves the embedded page and a JSON API that starts ProvisionDevEnvironment
 # workflows and relays their "status" query while the page polls.
 apiVersion: apps/v1
@@ -69,7 +72,7 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingressClassName }}
   rules:
-    - host: {{ required "baseDomain is required" .Values.baseDomain | quote }}
+    - host: {{ printf "%s.%s" .Values.landing.subdomain (required "baseDomain is required" .Values.baseDomain) | quote }}
       http:
         paths:
           - path: /

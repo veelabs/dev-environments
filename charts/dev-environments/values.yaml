@@ -39,8 +39,11 @@ provisioner:
       memory: 128Mi
 
 landing:
-  # Public "claim a devbox" page, served at https://<baseDomain>.
+  # Public "claim a devbox" page, served at https://<subdomain>.<baseDomain>
+  # (inside the wildcard edge route; no extra DNS needed). "oc" is safe: env
+  # hostnames are always oc-<name>.<baseDomain>, never bare oc.
   enabled: true
+  subdomain: oc
   image: ghcr.io/veelabs/dev-environments-landing:0.3.0
   # Lifetime granted to devboxes claimed from the page (Go duration).
   claimTTL: 1h

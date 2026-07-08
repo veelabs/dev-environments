@@ -11,8 +11,8 @@ public at `https://oc-<id>-<port>.<baseDomain>` (Codespaces-style, incl. the
 `Host: localhost` rewrite so Vite/Rails/etc. need zero config).
 
 ```
-landing page (https://<baseDomain>) ─┐
-temporal CLI ────────────────────────┴▶ Temporal ──▶ provisioner worker (Go)
+landing page (https://oc.<baseDomain>) ─┐
+temporal CLI ───────────────────────────┴▶ Temporal ──▶ provisioner worker (Go)
                                 │ SandboxClaim ──▶ agent-sandbox ──▶ pod (+ headless svc)
                                 ├ per-env Service + Ingress  (oc-<id>.<baseDomain>)
                                 └ durable TTL timer ──▶ teardown
@@ -21,8 +21,9 @@ port-router (nginx) ◀── HostRegexp IngressRoute (oc-<id>-<port>.<baseDomai
 
 ## Claim a devbox (landing page)
 
-`https://<baseDomain>` serves a one-click "claim a devbox" page (`landing`
-Deployment). The button starts a `ProvisionDevEnvironment` workflow with a
+`https://oc.<baseDomain>` (`landing.subdomain`, inside the existing wildcard
+edge route) serves a one-click "claim a devbox" page (`landing` Deployment).
+The button starts a `ProvisionDevEnvironment` workflow with a
 short TTL (`landing.claimTTL`, default 1h) and streams the workflow's `status`
 query as live progress steps until the environment URL appears. A capacity
 gate (`landing.maxConcurrent`) refuses new claims while too many environments
