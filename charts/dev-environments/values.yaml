@@ -44,7 +44,7 @@ landing:
   # hostnames are always oc-<name>.<baseDomain>, never bare oc.
   enabled: true
   subdomain: oc
-  image: ghcr.io/veelabs/dev-environments-landing:0.3.2
+  image: ghcr.io/veelabs/dev-environments-landing:0.3.3
   # Lifetime granted to devboxes claimed from the page (Go duration).
   claimTTL: 1h
   # Running ProvisionDevEnvironment workflows allowed before the page answers

@@ -198,6 +198,8 @@ func TestServesLandingPage(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Contains(t, rec.Header().Get("Content-Type"), "text/html")
 	require.Contains(t, rec.Body.String(), "Claim your devbox")
+	// Port-forwarding explainer on the ready panel.
+	require.Contains(t, rec.Body.String(), "Every port is already public")
 }
 
 func TestRandomNamesAreValidEnvNames(t *testing.T) {
