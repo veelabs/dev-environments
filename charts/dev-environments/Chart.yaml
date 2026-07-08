@@ -5,8 +5,8 @@ description: >-
   Kubernetes (Agent Sandbox CRDs), provisioned by a Temporal workflow, exposed
   per-environment (and per-port) behind an ingress.
 type: application
-version: 0.3.0
-appVersion: "0.3.0"
+version: 0.3.1
+appVersion: "0.3.1"
 home: https://github.com/veelabs/dev-environments
 annotations:
   # Cluster capabilities this chart CONSUMES but does not install.
