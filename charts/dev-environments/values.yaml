@@ -30,7 +30,7 @@ sandbox:
       memory: 1536Mi
 
 provisioner:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.3.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.3.2
   resources:
     requests:
       cpu: 50m
@@ -44,7 +44,7 @@ landing:
   # hostnames are always oc-<name>.<baseDomain>, never bare oc.
   enabled: true
   subdomain: oc
-  image: ghcr.io/veelabs/dev-environments-landing:0.3.1
+  image: ghcr.io/veelabs/dev-environments-landing:0.3.2
   # Lifetime granted to devboxes claimed from the page (Go duration).
   claimTTL: 1h
   # Running ProvisionDevEnvironment workflows allowed before the page answers

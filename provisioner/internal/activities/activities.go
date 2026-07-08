@@ -131,9 +131,12 @@ type AwaitSandboxReadyOutput struct {
 
 // AwaitSandboxReady polls the claim until its sandbox reports Ready, then
 // resolves the headless Service name. Long-running: heartbeats each poll.
+// The 1s tick is deliberate: this poll gates the claim-to-ready time and a
+// coarser tick quantizes it (readiness lands mid-interval). Load is bounded:
+// one GET/s per provisioning env, and capacity caps concurrent envs at 2-3.
 func (a *Activities) AwaitSandboxReady(ctx context.Context, envID string) (AwaitSandboxReadyOutput, error) {
 	out := AwaitSandboxReadyOutput{Hostname: a.hostname(envID)}
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 
 	for {

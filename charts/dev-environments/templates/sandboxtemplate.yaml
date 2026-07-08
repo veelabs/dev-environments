@@ -44,9 +44,13 @@ spec:
             httpGet:
               path: /api/health
               port: {{ .Values.sandbox.port }}
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 24 # first boot: openchamber spawns opencode
+            # Aggressive cadence: readiness gates the claim-to-ready time the
+            # landing page advertises, and a 10s initial delay was pure wait
+            # (openchamber is typically up in ~4s). Same overall first-boot
+            # budget as before: 2 + 2*60 = 122s (openchamber spawns opencode).
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 60
           resources:
             {{- toYaml .Values.sandbox.resources | nindent 12 }}
           volumeMounts:
