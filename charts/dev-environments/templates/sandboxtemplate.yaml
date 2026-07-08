@@ -1,0 +1,58 @@
+# SandboxTemplate for on-demand OpenCode/OpenChamber dev environments.
+# Claimed by the provisioner Temporal worker; one Sandbox (pod + headless
+# Service) per environment, exposed via a per-env Ingress.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: {{ .Values.sandbox.templateName }}
+spec:
+  # Headless Service per Sandbox — port-router resolves pod IPs through it.
+  service: true
+  # Provisioner injects ENV_ID etc. via the SandboxClaim.
+  envVarsInjectionPolicy: Allowed
+  # Unmanaged: agent-sandbox v0.5.0's managed NetworkPolicy selects a
+  # template-ref-hash label that claim-created (cold-start) pods do not carry.
+  # This chart owns the policy instead (templates/networkpolicy.yaml).
+  networkPolicyManagement: Unmanaged
+  podTemplate:
+    metadata:
+      labels:
+        app: {{ .Values.sandbox.templateName }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: openchamber
+          image: {{ .Values.sandbox.image }}
+          # Port override (image default is 3000): keep framework favourites
+          # (3000, 5173, 8080…) free for user apps.
+          args:
+            - openchamber
+            - --foreground
+            - --host
+            - "0.0.0.0"
+            - --port
+            - {{ .Values.sandbox.port | quote }}
+          env:
+            # OpenChamber refuses 0.0.0.0 without a UI password unless this is
+            # set. Deliberate: the edge (and NetworkPolicy) is the gate.
+            - name: OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN
+              value: "true"
+          ports:
+            - name: http
+              containerPort: {{ .Values.sandbox.port }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.sandbox.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 24 # first boot: openchamber spawns opencode
+          resources:
+            {{- toYaml .Values.sandbox.resources | nindent 12 }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: {{ .Values.sandbox.workspaceSize }}

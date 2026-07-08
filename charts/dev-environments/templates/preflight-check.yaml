@@ -1,0 +1,97 @@
+{{- if .Values.preflight.enabled }}
+# Executable dependency contract: fails the Argo sync (PreSync hook) with a
+# readable message when a required cluster capability is missing.
+# Checks: agent-sandbox CRDs (core + extensions), Traefik IngressRoute CRD,
+# TCP reachability of the Temporal frontend.
+# NOT checkable from in-cluster: the wildcard edge route (see README).
+{{- $tHost := (split ":" .Values.temporal.hostPort)._0 }}
+{{- $tPort := (split ":" .Values.temporal.hostPort)._1 }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/hook-weight: "-5"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-preflight-crd-read
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/hook-weight: "-5"
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-preflight-crd-read
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/hook-weight: "-5"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-preflight-crd-read
+subjects:
+  - kind: ServiceAccount
+    name: preflight
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preflight-check
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/hook-weight: "0"
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app: preflight-check
+    spec:
+      serviceAccountName: preflight
+      restartPolicy: Never
+      containers:
+        # Both containers must exit 0 for the Job (and the sync) to proceed.
+        - name: crd-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command:
+            - kubectl
+            - get
+            - crd
+            - sandboxes.agents.x-k8s.io
+            - sandboxtemplates.extensions.agents.x-k8s.io
+            - sandboxclaims.extensions.agents.x-k8s.io
+            - sandboxwarmpools.extensions.agents.x-k8s.io
+            - ingressroutes.traefik.io
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        - name: temporal-check
+          image: {{ .Values.preflight.busyboxImage }}
+          command:
+            - sh
+            - -c
+            - |
+              if nc -w 5 {{ $tHost }} {{ $tPort }} </dev/null; then
+                echo "temporal frontend reachable: {{ .Values.temporal.hostPort }}"
+              else
+                echo "PREFLIGHT FAILED: Temporal frontend unreachable at {{ .Values.temporal.hostPort }}" >&2
+                exit 1
+              fi
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
+{{- end }}

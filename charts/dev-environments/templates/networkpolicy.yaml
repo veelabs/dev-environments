@@ -1,0 +1,52 @@
+# Shared NetworkPolicy for all sandbox pods. Owned here (template is
+# networkPolicyManagement: Unmanaged) because the controller-managed policy in
+# agent-sandbox v0.5.0 selects a label that claim-created pods don't carry.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.sandbox.templateName }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.sandbox.templateName }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Ingress controller (kube-system) → OpenChamber UI only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: {{ .Values.sandbox.port }}
+    # port-router (this namespace) → arbitrary user dev servers, exposed as
+    # oc-<id>-<port>.<baseDomain>. No port list = all ports, but ONLY from the
+    # router; nothing can bind <1024 as non-root, and 127.0.0.1-bound
+    # listeners are unreachable anyway (the router targets the pod IP).
+    - from:
+        - podSelector:
+            matchLabels:
+              app: port-router
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public internet (git, npm, LLM APIs). Private ranges, CGNAT, and
+    # link-local/metadata stay blocked: sandboxes must not reach the cluster
+    # or adjacent private networks.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16

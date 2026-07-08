@@ -1,0 +1,57 @@
+# -- REQUIRED: public DNS suffix for environment hostnames
+#    (oc-<id>.<baseDomain>, oc-<id>-<port>.<baseDomain>).
+#    A wildcard route *.<baseDomain> must reach the cluster ingress.
+baseDomain: ""
+
+# -- REQUIRED: cluster DNS service IP, used by the port-router's nginx
+#    resolver (k3s default: 10.43.0.10; kubeadm default: 10.96.0.10).
+clusterDNS: ""
+
+temporal:
+  # Temporal frontend gRPC endpoint the provisioner worker connects to.
+  hostPort: temporal-frontend.temporal:7233
+  namespace: default
+  taskQueue: dev-environments
+
+sandbox:
+  # SandboxTemplate name; the zero-replica warm pool is derived from it as
+  # shadow-pool-<templateName> (load-bearing name, see docs/runbook.md).
+  templateName: opencode-dev
+  image: ghcr.io/veelabs/dev-environments-sandbox:1.17.15-1.14.1
+  # In-pod port OpenChamber listens on. Non-default (1982) keeps framework
+  # favourites (3000, 5173, 8080...) free for user apps.
+  port: 1982
+  workspaceSize: 5Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1536Mi
+
+provisioner:
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.2.0
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+portRouter:
+  image: nginx:1.29-alpine
+  # Bump to force a pod restart when the nginx ConfigMap changes.
+  configRevision: "1"
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+ingressClassName: traefik
+
+preflight:
+  enabled: true
+  kubectlImage: rancher/kubectl:v1.35.0
+  busyboxImage: busybox:1.37

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: dev-environments
+description: >-
+  On-demand cloud dev environments — OpenCode + OpenChamber sandboxes on
+  Kubernetes (Agent Sandbox CRDs), provisioned by a Temporal workflow, exposed
+  per-environment (and per-port) behind an ingress.
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+home: https://github.com/veelabs/dev-environments
+annotations:
+  # Cluster capabilities this chart CONSUMES but does not install.
+  # The preflight PreSync Job verifies 1-3; see README for the full table.
+  dev-environments.veelabs.dev/requires: |
+    1. agent-sandbox >= v0.5.0 (core + extensions CRDs, v1alpha1 SandboxClaims served)
+    2. Temporal frontend reachable at .Values.temporal.hostPort
+    3. Traefik with IngressRoute CRD (traefik.io/v1alpha1)
+    4. Wildcard edge route *.<baseDomain> -> ingress (manual)
+    5. NetworkPolicy-enforcing CNI with endPort support (k8s >= 1.25)

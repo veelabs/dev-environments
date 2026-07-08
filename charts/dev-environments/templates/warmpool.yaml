@@ -1,0 +1,20 @@
+# Zero-replica warm pool backing all SandboxClaims.
+#
+# agent-sandbox v0.5.0 mechanics (verified live):
+# - v1beta1 SandboxClaims can ONLY reference a SandboxWarmPool (warmPoolRef is
+#   required); the direct claim→template path was removed.
+# - The provisioner creates claims via the still-served v1alpha1 API with
+#   sandboxTemplateRef + warmpool:"none"; the conversion webhook rewrites that
+#   to warmPoolRef {name: "shadow-pool-<template>"} — this object. The name is
+#   therefore load-bearing; do not rename.
+# - replicas: 0 → the pool never pre-warms anything; each claim "falls
+#   completely to cold start" (upstream sandboxclaim_controller.go) and gets a
+#   fresh sandbox from the template. No standing cost.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: shadow-pool-{{ .Values.sandbox.templateName }}
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: {{ .Values.sandbox.templateName }}

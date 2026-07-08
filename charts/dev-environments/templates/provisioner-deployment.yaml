@@ -1,0 +1,41 @@
+# Temporal worker: provisions/deprovisions dev environments.
+# Workflows: ProvisionDevEnvironment, DeprovisionDevEnvironment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provisioner
+  labels:
+    app: provisioner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provisioner
+  template:
+    metadata:
+      labels:
+        app: provisioner
+    spec:
+      serviceAccountName: provisioner
+      containers:
+        - name: worker
+          image: {{ .Values.provisioner.image }}
+          env:
+            - name: TEMPORAL_HOSTPORT
+              value: {{ .Values.temporal.hostPort | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | quote }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: SANDBOX_TEMPLATE
+              value: {{ .Values.sandbox.templateName | quote }}
+            - name: SANDBOX_PORT
+              value: {{ .Values.sandbox.port | quote }}
+            - name: BASE_DOMAIN
+              value: {{ required "baseDomain is required" .Values.baseDomain | quote }}
+            - name: TRAEFIK_URL
+              value: {{ .Values.healthProbeURL | default "http://traefik.kube-system" | quote }}
+          resources:
+            {{- toYaml .Values.provisioner.resources | nindent 12 }}
