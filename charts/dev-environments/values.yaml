@@ -30,7 +30,7 @@ sandbox:
       memory: 1536Mi
 
 provisioner:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.2.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.2.1
   resources:
     requests:
       cpu: 50m

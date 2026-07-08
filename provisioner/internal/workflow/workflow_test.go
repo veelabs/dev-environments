@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,4 +159,69 @@ func TestDeprovisionRequiresEnvID(t *testing.T) {
 	e.ExecuteWorkflow(DeprovisionDevEnvironment, "")
 	require.True(t, e.IsWorkflowCompleted())
 	require.Error(t, e.GetWorkflowError())
+}
+
+func TestNormalizeEnvID(t *testing.T) {
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"", "", false},                        // empty → caller generates
+		{"vee", "oc-vee", false},               // friendly name gets the prefix
+		{"VEE", "oc-vee", false},               // lowercased
+		{"oc-vee", "oc-vee", false},            // already prefixed: no double prefix
+		{"my-app", "oc-my-app", false},         // hyphens fine
+		{"vee-202468", "oc-vee-202468", false}, // 6 digits: not a port shape
+		{"vee-2024", "", true},                 // trailing -<digits>: port collision
+		{"oc-x-99", "", true},                  // same, already-prefixed form
+		{"grafana", "oc-grafana", false},       // service names are safe: prefixed
+		{"Vee.Dev", "", true},                  // dots invalid
+		{"-vee", "", true},                     // edge hyphen
+		{strings.Repeat("a", 60), "", true},    // too long
+	}
+	for _, c := range cases {
+		got, err := normalizeEnvID(c.in)
+		if c.wantErr {
+			require.Error(t, err, "input %q", c.in)
+			continue
+		}
+		require.NoError(t, err, "input %q", c.in)
+		require.Equal(t, c.want, got, "input %q", c.in)
+	}
+}
+
+func TestProvisionRejectsInvalidName(t *testing.T) {
+	e := env(t)
+	// No activities expected: validation fails before any resource is created.
+	e.ExecuteWorkflow(ProvisionDevEnvironment, ProvisionInput{Name: "vee-2024"})
+	require.True(t, e.IsWorkflowCompleted())
+	require.Error(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
+}
+
+func TestProvisionPrefixesFriendlyName(t *testing.T) {
+	e := env(t)
+	e.OnActivity("CreateSandboxClaim", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			in := args.Get(1).(activities.CreateSandboxClaimInput)
+			require.Equal(t, "oc-vee", in.EnvID)
+		}).Return(nil).Once()
+	e.OnActivity("AwaitSandboxReady", mock.Anything, "oc-vee").
+		Return(activities.AwaitSandboxReadyOutput{
+			SandboxName: "oc-vee", Selector: "h=1", Hostname: "oc-vee.renala.dev",
+		}, nil).Once()
+	e.OnActivity("CreateService", mock.Anything, mock.Anything).Return("oc-vee-http", nil).Once()
+	e.OnActivity("CreateIngress", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("VerifyHealth", mock.Anything, "oc-vee").Return(nil).Once()
+	e.OnActivity("DeleteIngress", mock.Anything, "oc-vee").Return(nil).Once()
+	e.OnActivity("DeleteService", mock.Anything, "oc-vee").Return(nil).Once()
+	e.OnActivity("DeleteSandboxClaim", mock.Anything, "oc-vee").Return(nil).Once()
+
+	e.ExecuteWorkflow(ProvisionDevEnvironment, ProvisionInput{Name: "vee", TTL: "1h"})
+	require.True(t, e.IsWorkflowCompleted())
+	require.NoError(t, e.GetWorkflowError())
+	var out ProvisionOutput
+	require.NoError(t, e.GetWorkflowResult(&out))
+	require.Equal(t, "oc-vee", out.EnvID)
+	e.AssertExpectations(t)
 }

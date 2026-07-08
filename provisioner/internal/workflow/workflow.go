@@ -3,7 +3,9 @@ package workflow
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -21,7 +23,9 @@ const (
 
 // ProvisionInput parametrizes ProvisionDevEnvironment.
 type ProvisionInput struct {
-	// Name overrides the generated env ID (must be a DNS label). Optional.
+	// Name is a friendly environment name; the env ID becomes oc-<name>
+	// (hostnames are confined to the reserved oc-* prefix so they can never
+	// collide with other cluster services). Optional.
 	Name string `json:"name,omitempty"`
 	// TTL is how long the environment lives, as a Go duration string ("8h",
 	// "90m"). Default 8h, capped at 24h.
@@ -64,7 +68,10 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 		ttl = MaxTTL
 	}
 
-	envID := in.Name
+	envID, err := normalizeEnvID(in.Name)
+	if err != nil {
+		return ProvisionOutput{}, err
+	}
 	if envID == "" {
 		envID = "oc-" + strconv.FormatInt(workflow.Now(ctx).Unix(), 10)
 	}
@@ -181,6 +188,36 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 	status.Phase = "expired"
 
 	return ProvisionOutput{EnvID: envID, URL: url, Until: shutdownAt}, nil
+}
+
+var (
+	envNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+	// Mirrors the port-router's port capture ([0-9]{2,5}): an env ID with this
+	// tail would make its own base hostname parse as <env>-<port>.
+	trailingPortRe = regexp.MustCompile(`-[0-9]{2,5}$`)
+)
+
+// normalizeEnvID turns a user-supplied name into a safe env ID confined to
+// the reserved oc-* hostname prefix. Pure input transform: replay-safe.
+func normalizeEnvID(name string) (string, error) {
+	if name == "" {
+		return "", nil // caller generates oc-<unix-ts>
+	}
+	id := strings.ToLower(strings.TrimSpace(name))
+	if !strings.HasPrefix(id, "oc-") {
+		id = "oc-" + id
+	}
+	rest := strings.TrimPrefix(id, "oc-")
+	if !envNameRe.MatchString(rest) {
+		return "", fmt.Errorf("invalid name %q: must be a lowercase DNS label (a-z, 0-9, non-edge hyphens)", name)
+	}
+	if len(id) > 43 { // oc-<name>-http service name and -<port> hostnames stay <=63
+		return "", fmt.Errorf("invalid name %q: too long (max %d chars incl. oc- prefix)", name, 43)
+	}
+	if trailingPortRe.MatchString(rest) {
+		return "", fmt.Errorf("invalid name %q: must not end in -<2..5 digits> — the base hostname would be indistinguishable from a port-forward hostname", name)
+	}
+	return id, nil
 }
 
 // DeprovisionDevEnvironment force-removes an environment's resources. Used for

@@ -42,7 +42,7 @@ logger output (`temporal.renala.dev` UI → workflow → history).
 | Workflow ID | anything unique, e.g. `dev-env-<date>` |
 | Task Queue | `dev-environments` |
 | Workflow Type | `ProvisionDevEnvironment` |
-| Input | optional JSON: `{"name":"oc-myname","ttl":"4h"}` — empty = defaults (8h) |
+| Input | optional JSON: `{"name":"myname","ttl":"4h"}` — empty = defaults (8h). Names are normalized to the reserved `oc-` prefix (`myname` → `oc-myname`); trailing `-<digits>` names are rejected (port-hostname collision). |
 
 **Get the URL:** open the running workflow → **Queries** tab → select `status`
 → result contains `url` and `phase` (`ready` when live).
@@ -143,8 +143,9 @@ Rules of thumb:
 - HTTP/WebSocket/SSE only — raw TCP needs a quick tunnel from inside the env
   (`cloudflared tunnel --url http://localhost:<port>`, egress is open).
 - Exposed apps share the env's auth posture (currently: none — Access snoozed).
-- Don't give envs custom names ending in `-<digits>` — the router would parse
-  the tail as a port. Generated names (`oc-<unix-ts>`) are safe.
+- Env names are validated: normalized to the reserved `oc-` prefix, and names
+  ending in `-<2..5 digits>` are rejected (their base hostname would parse as
+  a port-forward hostname).
 
 ## Users & credentials
 
