@@ -30,13 +30,29 @@ sandbox:
       memory: 1536Mi
 
 provisioner:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.2.1
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.3.0
   resources:
     requests:
       cpu: 50m
       memory: 64Mi
     limits:
       memory: 128Mi
+
+landing:
+  # Public "claim a devbox" page, served at https://<baseDomain>.
+  enabled: true
+  image: ghcr.io/veelabs/dev-environments-landing:0.3.0
+  # Lifetime granted to devboxes claimed from the page (Go duration).
+  claimTTL: 1h
+  # Running ProvisionDevEnvironment workflows allowed before the page answers
+  # "all devboxes are taken" (capacity: 2-3 envs on the current nodes).
+  maxConcurrent: 2
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
 
 portRouter:
   image: nginx:1.29-alpine

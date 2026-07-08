@@ -11,12 +11,22 @@ public at `https://oc-<id>-<port>.<baseDomain>` (Codespaces-style, incl. the
 `Host: localhost` rewrite so Vite/Rails/etc. need zero config).
 
 ```
-temporal CLI ──▶ Temporal ──▶ provisioner worker (Go)
+landing page (https://<baseDomain>) ─┐
+temporal CLI ────────────────────────┴▶ Temporal ──▶ provisioner worker (Go)
                                 │ SandboxClaim ──▶ agent-sandbox ──▶ pod (+ headless svc)
                                 ├ per-env Service + Ingress  (oc-<id>.<baseDomain>)
                                 └ durable TTL timer ──▶ teardown
 port-router (nginx) ◀── HostRegexp IngressRoute (oc-<id>-<port>.<baseDomain>)
 ```
+
+## Claim a devbox (landing page)
+
+`https://<baseDomain>` serves a one-click "claim a devbox" page (`landing`
+Deployment). The button starts a `ProvisionDevEnvironment` workflow with a
+short TTL (`landing.claimTTL`, default 1h) and streams the workflow's `status`
+query as live progress steps until the environment URL appears. A capacity
+gate (`landing.maxConcurrent`) refuses new claims while too many environments
+are running. Disable with `landing.enabled: false`.
 
 ## Deploy
 
@@ -47,7 +57,7 @@ Verified by the PreSync `preflight-check` Job unless noted:
 | Traefik | default ingress class; `IngressRoute` CRD (`traefik.io/v1alpha1`); reachable at `healthProbeURL` for provision-time health checks |
 | Edge (⚠ not machine-checked) | wildcard `*.<baseDomain>` DNS + route to the ingress; TLS terminated upstream (pods speak plain HTTP) |
 | CNI (⚠ not machine-checked) | enforces NetworkPolicy incl. `endPort` (Kubernetes ≥ 1.25) |
-| Registry | anonymous pull of `ghcr.io/veelabs/dev-environments-{sandbox,provisioner}` |
+| Registry | anonymous pull of `ghcr.io/veelabs/dev-environments-{sandbox,provisioner,landing}` |
 
 Security note: environments have no built-in auth. Gate `oc-*.<baseDomain>`
 at the edge (e.g. Cloudflare Access) or accept public exposure knowingly.
@@ -69,13 +79,15 @@ Full operational guide: [`docs/runbook.md`](docs/runbook.md).
 | Path | What |
 |---|---|
 | `charts/dev-environments/` | Helm chart (the deployable) |
-| `provisioner/` | Go Temporal worker: workflows + k8s activities |
+| `provisioner/` | Go module: Temporal worker (workflows + k8s activities) and landing server |
 | `images/sandbox/` | OpenCode + OpenChamber sandbox image |
 | `images/provisioner/` | worker image |
+| `images/landing/` | landing page image |
 | `docs/` | runbook + design notes |
 
 ## Versions
 
 Images are pinned by tag in `values.yaml`; CI (`.github/workflows/images.yaml`)
-builds `dev-environments-sandbox:<opencode>-<openchamber>` and
-`dev-environments-provisioner:<appVersion>` on change.
+builds `dev-environments-sandbox:<opencode>-<openchamber>`,
+`dev-environments-provisioner:<appVersion>`, and
+`dev-environments-landing:<appVersion>` on change.

@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>devboxes — your dev environment in 10 seconds</title>
+<meta name="description" content="Claim an on-demand cloud dev environment with OpenCode and OpenChamber preinstalled. No config, no setup. Ready in seconds.">
+<style>
+  :root {
+    --bg: #070a12;
+    --panel: #0d1220;
+    --panel-2: #111830;
+    --line: rgba(148, 163, 216, .14);
+    --text: #e7ecf8;
+    --muted: #8b96b8;
+    --accent: #6ee7b7;
+    --accent-2: #60a5fa;
+    --danger: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    overflow-x: hidden;
+  }
+  /* ambient glow */
+  .glow {
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(600px 400px at 50% -10%, rgba(96,165,250,.18), transparent 70%),
+      radial-gradient(500px 350px at 80% 20%, rgba(110,231,183,.10), transparent 70%),
+      radial-gradient(700px 500px at 15% 30%, rgba(139,92,246,.08), transparent 70%);
+  }
+  main { position: relative; z-index: 1; width: min(680px, 92vw); padding: 9vh 0 8vh; text-align: center; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: .5rem;
+    font-size: .8rem; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: .3rem .9rem; margin-bottom: 2rem;
+    background: rgba(13,18,32,.6); backdrop-filter: blur(6px);
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  h1 {
+    font-size: clamp(2.2rem, 6vw, 3.4rem);
+    line-height: 1.12; letter-spacing: -.02em; font-weight: 750;
+    margin-bottom: 1.1rem;
+  }
+  h1 .grad {
+    background: linear-gradient(92deg, var(--accent) 0%, var(--accent-2) 55%, #a78bfa 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { color: var(--muted); font-size: 1.08rem; max-width: 54ch; margin: 0 auto 2.4rem; }
+  .sub strong { color: var(--text); font-weight: 600; }
+
+  .cta {
+    appearance: none; border: 0; cursor: pointer;
+    font: 600 1.1rem/1 inherit; color: #04110b;
+    background: linear-gradient(92deg, var(--accent), #34d399);
+    padding: 1.05rem 2.4rem; border-radius: 14px;
+    box-shadow: 0 0 0 1px rgba(110,231,183,.35), 0 8px 40px rgba(52,211,153,.28);
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .cta:hover { transform: translateY(-2px); box-shadow: 0 0 0 1px rgba(110,231,183,.5), 0 12px 48px rgba(52,211,153,.4); }
+  .cta:active { transform: translateY(0); }
+  .cta-hint { margin-top: .9rem; font-size: .84rem; color: var(--muted); }
+
+  .features {
+    display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;
+    margin-top: 4rem;
+  }
+  .feature {
+    flex: 1 1 180px; max-width: 215px; text-align: left;
+    border: 1px solid var(--line); border-radius: 14px;
+    background: rgba(13,18,32,.55); padding: 1rem 1.1rem;
+  }
+  .feature h3 { font-size: .92rem; margin-bottom: .25rem; }
+  .feature p { font-size: .82rem; color: var(--muted); line-height: 1.45; }
+
+  /* ---- claim panel ---- */
+  .panel {
+    display: none; text-align: left;
+    border: 1px solid var(--line); border-radius: 18px;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    padding: 1.8rem 2rem; margin-top: .4rem;
+    box-shadow: 0 20px 60px rgba(0,0,0,.45);
+  }
+  .panel.visible { display: block; animation: rise .35s ease; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 1.3rem; }
+  .panel-title { font-weight: 650; font-size: 1.05rem; }
+  .env-name { font-family: var(--mono); font-size: .85rem; color: var(--accent); }
+  .elapsed { font-family: var(--mono); font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  ol.steps { list-style: none; display: grid; gap: .65rem; }
+  .step { display: flex; align-items: center; gap: .8rem; color: var(--muted); font-size: .95rem; transition: color .3s; }
+  .step .icon {
+    width: 22px; height: 22px; flex: 0 0 22px; border-radius: 50%;
+    border: 2px solid var(--line); position: relative;
+  }
+  .step.active { color: var(--text); }
+  .step.active .icon { border-color: transparent; }
+  .step.active .icon::after {
+    content: ""; position: absolute; inset: -2px; border-radius: 50%;
+    border: 2px solid var(--accent-2); border-top-color: transparent;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .step.done { color: var(--text); }
+  .step.done .icon { border-color: var(--accent); background: rgba(110,231,183,.12); }
+  .step.done .icon::after {
+    content: ""; position: absolute; left: 6px; top: 3px;
+    width: 5px; height: 9px;
+    border: solid var(--accent); border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+
+  /* ---- ready ---- */
+  .ready { display: none; text-align: center; }
+  .ready.visible { display: block; animation: rise .4s ease; }
+  .ready h2 { font-size: 1.5rem; margin-bottom: .4rem; }
+  .ready .took { color: var(--muted); font-size: .9rem; margin-bottom: 1.4rem; }
+  .url-card {
+    display: flex; align-items: center; gap: .8rem;
+    border: 1px solid rgba(110,231,183,.35); border-radius: 14px;
+    background: rgba(110,231,183,.07);
+    padding: .9rem 1.1rem; margin-bottom: 1.2rem;
+  }
+  .url-card code { font-family: var(--mono); font-size: .95rem; color: var(--accent); overflow-wrap: anywhere; flex: 1; text-align: left; }
+  .copy {
+    appearance: none; cursor: pointer; border: 1px solid var(--line); border-radius: 8px;
+    background: transparent; color: var(--muted); font: 500 .78rem/1 inherit; padding: .45rem .7rem;
+    transition: color .15s, border-color .15s;
+  }
+  .copy:hover { color: var(--text); border-color: var(--muted); }
+  .open-btn {
+    display: inline-block; text-decoration: none;
+    font: 600 1.05rem/1 inherit; color: #04110b;
+    background: linear-gradient(92deg, var(--accent), #34d399);
+    padding: .95rem 2.1rem; border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(52,211,153,.3);
+    transition: transform .15s ease;
+  }
+  .open-btn:hover { transform: translateY(-2px); }
+  .expiry { margin-top: 1.1rem; font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* ---- notice (capacity / error) ---- */
+  .notice { display: none; text-align: center; }
+  .notice.visible { display: block; animation: rise .35s ease; }
+  .notice h2 { font-size: 1.25rem; margin-bottom: .5rem; }
+  .notice p { color: var(--muted); font-size: .95rem; margin-bottom: 1.4rem; }
+  .notice.error h2 { color: var(--danger); }
+  .retry {
+    appearance: none; cursor: pointer; border: 1px solid var(--line); border-radius: 10px;
+    background: transparent; color: var(--text); font: 600 .95rem/1 inherit; padding: .75rem 1.6rem;
+    transition: border-color .15s;
+  }
+  .retry:hover { border-color: var(--muted); }
+
+  footer { position: relative; z-index: 1; margin-top: auto; padding: 1.4rem; font-size: .78rem; color: var(--muted); }
+  footer a { color: var(--muted); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="glow"></div>
+
+<main>
+  <div class="badge"><span class="dot"></span> Temporal-orchestrated &middot; Kubernetes-native &middot; zero config</div>
+
+  <section id="hero">
+    <h1>Your dev environment.<br><span class="grad">Ready in 10 seconds.</span></h1>
+    <p class="sub">
+      Claim a fresh cloud devbox with <strong>OpenCode</strong> and <strong>OpenChamber</strong>
+      preinstalled and already running. No dotfiles, no Docker, no YAML —
+      click once and start building.
+    </p>
+    <button class="cta" id="claim-btn">Claim your devbox &rarr;</button>
+    <p class="cta-hint">Free for 1 hour &middot; no sign-up &middot; a real sandbox, not a demo</p>
+
+    <div class="features">
+      <div class="feature">
+        <h3>OpenCode, preloaded</h3>
+        <p>The AI coding agent is installed and on PATH. <code>opencode auth login</code> and go.</p>
+      </div>
+      <div class="feature">
+        <h3>OpenChamber web IDE</h3>
+        <p>A full workspace in your browser the moment the URL appears.</p>
+      </div>
+      <div class="feature">
+        <h3>Ports just work</h3>
+        <p>Run a dev server on any port and it's instantly on a public URL — Codespaces-style.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="progress-panel">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">Provisioning your devbox</div>
+        <div class="env-name" id="env-name"></div>
+      </div>
+      <div class="elapsed" id="elapsed">0.0s</div>
+    </div>
+    <ol class="steps" id="steps">
+      <li class="step" data-phase="claiming"><span class="icon"></span> Claiming a sandbox</li>
+      <li class="step" data-phase="starting"><span class="icon"></span> Booting your devbox</li>
+      <li class="step" data-phase="wiring"><span class="icon"></span> Wiring up your URL</li>
+      <li class="step" data-phase="verifying"><span class="icon"></span> Running health checks</li>
+    </ol>
+  </section>
+
+  <section class="panel ready" id="ready-panel">
+    <h2>&#127881; Your devbox is live</h2>
+    <p class="took" id="took"></p>
+    <div class="url-card">
+      <code id="env-url"></code>
+      <button class="copy" id="copy-btn">Copy</button>
+    </div>
+    <a class="open-btn" id="open-btn" href="#" target="_blank" rel="noopener">Open your devbox &rarr;</a>
+    <p class="expiry" id="expiry"></p>
+  </section>
+
+  <section class="panel notice" id="capacity-panel">
+    <h2>All devboxes are taken</h2>
+    <p id="capacity-msg">Every sandbox is currently claimed. They free up as sessions expire — try again in a few minutes.</p>
+    <button class="retry" id="capacity-retry">Try again</button>
+  </section>
+
+  <section class="panel notice error" id="error-panel">
+    <h2>Something went sideways</h2>
+    <p id="error-msg">Provisioning hit a snag. The workflow cleans up after itself — just try again.</p>
+    <button class="retry" id="error-retry">Try again</button>
+  </section>
+</main>
+
+<footer>
+  A proof of concept: one click &rarr; Temporal workflow &rarr; Kubernetes sandbox &rarr; live URL.
+</footer>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const hero = $("hero");
+  const panels = ["progress-panel", "ready-panel", "capacity-panel", "error-panel"].map($);
+
+  const PHASES = ["claiming", "starting", "wiring", "verifying"];
+  const POLL_MS = 1200;
+  const GIVE_UP_MS = 240000; // 4 min hard ceiling before we call it a failure
+  const STORE_KEY = "devbox-claim";
+
+  let pollTimer = null, elapsedTimer = null, countdownTimer = null, startedAt = 0;
+
+  function show(panel) {
+    hero.classList.toggle("hidden", panel !== null);
+    panels.forEach(p => p.classList.toggle("visible", p === panel));
+  }
+
+  function stopTimers() {
+    clearTimeout(pollTimer); clearInterval(elapsedTimer); clearInterval(countdownTimer);
+  }
+
+  function reset() {
+    stopTimers();
+    localStorage.removeItem(STORE_KEY);
+    show(null);
+  }
+
+  function setSteps(phase) {
+    const idx = phase === "ready" ? PHASES.length : PHASES.indexOf(phase);
+    document.querySelectorAll(".step").forEach((el, i) => {
+      el.classList.toggle("done", i < idx);
+      el.classList.toggle("active", i === idx);
+    });
+  }
+
+  function startElapsed() {
+    startedAt = Date.now();
+    elapsedTimer = setInterval(() => {
+      $("elapsed").textContent = ((Date.now() - startedAt) / 1000).toFixed(1) + "s";
+    }, 100);
+  }
+
+  function showReady(st) {
+    stopTimers();
+    const secs = startedAt ? ((Date.now() - startedAt) / 1000).toFixed(1) : null;
+    $("took").textContent = secs ? `Provisioned in ${secs} seconds.` : "Reattached to your running devbox.";
+    $("env-url").textContent = st.url;
+    $("open-btn").href = st.url;
+    if (st.until) {
+      const until = new Date(st.until);
+      countdownTimer = setInterval(() => {
+        const left = until - Date.now();
+        if (left <= 0) { clearInterval(countdownTimer); reset(); return; }
+        const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+        $("expiry").textContent = `Yours for another ${m}:${String(s).padStart(2, "0")} — then it tidies itself away.`;
+      }, 1000);
+    }
+    show($("ready-panel"));
+  }
+
+  function showError(msg) {
+    stopTimers();
+    localStorage.removeItem(STORE_KEY);
+    if (msg) $("error-msg").textContent = msg;
+    show($("error-panel"));
+  }
+
+  async function poll(id, deadline) {
+    if (Date.now() > deadline) {
+      showError("This is taking far longer than it should. The workflow will clean up after itself — try again.");
+      return;
+    }
+    let res, st;
+    try {
+      res = await fetch(`/api/claim/${encodeURIComponent(id)}`, { cache: "no-store" });
+      st = await res.json();
+    } catch {
+      pollTimer = setTimeout(() => poll(id, deadline), POLL_MS * 2); // transient network blip
+      return;
+    }
+    if (res.status === 404) { reset(); return; }
+    if (!res.ok) { pollTimer = setTimeout(() => poll(id, deadline), POLL_MS * 2); return; }
+
+    switch (st.phase) {
+      case "ready":
+        setSteps("ready");
+        setTimeout(() => showReady(st), 400); // let the last checkmark land
+        return;
+      case "failed":
+        showError();
+        return;
+      case "expired":
+      case "deleted":
+        reset();
+        return;
+      default:
+        setSteps(st.phase);
+        pollTimer = setTimeout(() => poll(id, deadline), POLL_MS);
+    }
+  }
+
+  function track(id) {
+    $("env-name").textContent = id;
+    setSteps("claiming");
+    show($("progress-panel"));
+    startElapsed();
+    poll(id, Date.now() + GIVE_UP_MS);
+  }
+
+  async function claim() {
+    const btn = $("claim-btn");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/claim", { method: "POST" });
+      const body = await res.json();
+      if (res.status === 503 && body.error === "capacity") {
+        if (body.message) $("capacity-msg").textContent = body.message;
+        show($("capacity-panel"));
+        return;
+      }
+      if (!res.ok) { showError(body.message); return; }
+      localStorage.setItem(STORE_KEY, body.id);
+      track(body.id);
+    } catch {
+      showError("Could not reach the server. Check your connection and try again.");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  $("claim-btn").addEventListener("click", claim);
+  $("capacity-retry").addEventListener("click", () => { show(null); claim(); });
+  $("error-retry").addEventListener("click", () => { show(null); claim(); });
+  $("copy-btn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("env-url").textContent);
+      $("copy-btn").textContent = "Copied!";
+      setTimeout(() => { $("copy-btn").textContent = "Copy"; }, 1500);
+    } catch { /* clipboard unavailable; URL is visible anyway */ }
+  });
+
+  // Re-attach to a claim from a previous visit (e.g. page refresh mid-provision).
+  const existing = localStorage.getItem(STORE_KEY);
+  if (existing) track(existing);
+})();
+</script>
+</body>
+</html>

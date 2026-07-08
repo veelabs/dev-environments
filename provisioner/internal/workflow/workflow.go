@@ -39,6 +39,18 @@ type ProvisionOutput struct {
 	Until time.Time `json:"until"`
 }
 
+// Provisioning phases surfaced through the "status" query, in order. UIs
+// (e.g. the landing page) render these as live progress steps.
+const (
+	PhaseClaiming  = "claiming"  // creating the SandboxClaim
+	PhaseStarting  = "starting"  // waiting for the sandbox pod to be Ready
+	PhaseWiring    = "wiring"    // creating Service + Ingress
+	PhaseVerifying = "verifying" // end-to-end health check through the edge
+	PhaseReady     = "ready"     // environment is live
+	PhaseExpired   = "expired"   // TTL elapsed, teardown in progress
+	PhaseDeleted   = "deleted"   // resources removed
+)
+
 // Status answers the "status" query while the workflow is running.
 type Status struct {
 	Phase string `json:"phase"`
@@ -76,7 +88,7 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 		envID = "oc-" + strconv.FormatInt(workflow.Now(ctx).Unix(), 10)
 	}
 
-	status := Status{Phase: "provisioning", EnvID: envID}
+	status := Status{Phase: PhaseClaiming, EnvID: envID}
 	if err := workflow.SetQueryHandler(ctx, "status", func() (Status, error) {
 		return status, nil
 	}); err != nil {
@@ -129,7 +141,7 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 		if err := workflow.ExecuteActivity(cleanupCtx, a.DeleteSandboxClaim, envID).Get(cleanupCtx, nil); err != nil {
 			logger.Error("teardown: delete sandbox claim failed", "envID", envID, "error", err)
 		}
-		status.Phase = "deleted"
+		status.Phase = PhaseDeleted
 	}
 
 	shutdownAt := workflow.Now(ctx).Add(ttl)
@@ -147,6 +159,7 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 	defer teardown()
 
 	// 2. Wait for the sandbox pod to be Ready.
+	status.Phase = PhaseStarting
 	var ready activities.AwaitSandboxReadyOutput
 	if err := workflow.ExecuteActivity(waitCtx, a.AwaitSandboxReady, envID).Get(ctx, &ready); err != nil {
 		return ProvisionOutput{}, fmt.Errorf("await sandbox ready: %w", err)
@@ -154,6 +167,7 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 
 	// 3. Per-env Service with a real port — the sandbox controller's headless
 	// Service is portless and cannot back an Ingress.
+	status.Phase = PhaseWiring
 	var serviceName string
 	if err := workflow.ExecuteActivity(shortCtx, a.CreateService, activities.CreateServiceInput{
 		EnvID:    envID,
@@ -171,12 +185,13 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 	}
 
 	// 5. Verify the Traefik→Service→pod path end to end.
+	status.Phase = PhaseVerifying
 	if err := workflow.ExecuteActivity(shortCtx, a.VerifyHealth, envID).Get(ctx, nil); err != nil {
 		return ProvisionOutput{}, fmt.Errorf("verify health: %w", err)
 	}
 
 	url := "https://" + ready.Hostname
-	status.Phase = "ready"
+	status.Phase = PhaseReady
 	status.URL = url
 	status.Until = shutdownAt.UTC().Format(time.RFC3339)
 	logger.Info("dev environment ready", "envID", envID, "url", url, "until", status.Until)
@@ -185,7 +200,7 @@ func ProvisionDevEnvironment(ctx workflow.Context, in ProvisionInput) (Provision
 	if err := workflow.Sleep(ctx, ttl); err != nil {
 		logger.Info("TTL sleep interrupted (cancellation) — tearing down", "envID", envID, "error", err)
 	}
-	status.Phase = "expired"
+	status.Phase = PhaseExpired
 
 	return ProvisionOutput{EnvID: envID, URL: url, Until: shutdownAt}, nil
 }

@@ -104,6 +104,47 @@ func TestProvisionCancellationTearsDown(t *testing.T) {
 	e.AssertExpectations(t)
 }
 
+func TestProvisionStatusQueryReportsReady(t *testing.T) {
+	e := env(t)
+
+	e.OnActivity("CreateSandboxClaim", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("AwaitSandboxReady", mock.Anything, mock.Anything).
+		Return(activities.AwaitSandboxReadyOutput{
+			SandboxName: "oc-q", Selector: "h=1", Hostname: "oc-q.renala.dev",
+		}, nil).Once()
+	e.OnActivity("CreateService", mock.Anything, mock.Anything).Return("svc-http", nil).Once()
+	e.OnActivity("CreateIngress", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("VerifyHealth", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("DeleteIngress", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("DeleteService", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("DeleteSandboxClaim", mock.Anything, mock.Anything).Return(nil).Once()
+
+	// Mid-TTL the status query must expose the live URL for pollers.
+	e.RegisterDelayedCallback(func() {
+		v, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var st Status
+		require.NoError(t, v.Get(&st))
+		require.Equal(t, PhaseReady, st.Phase)
+		require.Equal(t, "oc-q", st.EnvID)
+		require.Equal(t, "https://oc-q.renala.dev", st.URL)
+		require.NotEmpty(t, st.Until)
+	}, 10*time.Minute)
+
+	e.ExecuteWorkflow(ProvisionDevEnvironment, ProvisionInput{Name: "oc-q", TTL: "1h"})
+
+	require.True(t, e.IsWorkflowCompleted())
+	require.NoError(t, e.GetWorkflowError())
+
+	// After teardown the final queryable phase is "deleted".
+	v, err := e.QueryWorkflow("status")
+	require.NoError(t, err)
+	var st Status
+	require.NoError(t, v.Get(&st))
+	require.Equal(t, PhaseDeleted, st.Phase)
+	e.AssertExpectations(t)
+}
+
 func TestProvisionTTLDefaultsAndCap(t *testing.T) {
 	e := env(t)
 
