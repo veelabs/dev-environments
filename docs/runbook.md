@@ -33,6 +33,28 @@ temporal --address ... workflow query \
 The same URL is also the workflow result at completion, and in the workflow's
 logger output (`temporal.renala.dev` UI → workflow → history).
 
+## From the Temporal Web UI (no CLI needed)
+
+**Provision:** Workflows page → **Start Workflow**:
+
+| Field | Value |
+|---|---|
+| Workflow ID | anything unique, e.g. `dev-env-<date>` |
+| Task Queue | `dev-environments` |
+| Workflow Type | `ProvisionDevEnvironment` |
+| Input | optional JSON: `{"name":"oc-myname","ttl":"4h"}` — empty = defaults (8h) |
+
+**Get the URL:** open the running workflow → **Queries** tab → select `status`
+→ result contains `url` and `phase` (`ready` when live).
+
+**Deprovision:** open the workflow → **Request Cancellation**. Cancellation
+wakes the TTL timer and runs the full teardown before the workflow completes.
+
+> ⚠️ **Never use Terminate** for routine teardown: terminate kills the
+> workflow WITHOUT running its cleanup — the environment's claim/Service/
+> Ingress are orphaned. If that happens, start a `DeprovisionDevEnvironment`
+> workflow with input `"oc-<id>"` to sweep them.
+
 ## Tear down early
 
 ```sh
