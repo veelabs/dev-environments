@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -192,6 +193,7 @@ func (a *Activities) CreateHermesSandbox(ctx context.Context, agentID string) (s
 
 func (a *Activities) AwaitHermesReady(ctx context.Context, agentID string) (AwaitHermesReadyOutput, error) {
 	out := AwaitHermesReadyOutput{Hostname: a.hostname(agentID)}
+	lastDiagnostic := "Sandbox has not reported a status"
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -207,12 +209,87 @@ func (a *Activities) AwaitHermesReady(ctx context.Context, agentID string) (Awai
 			}
 			return out, nil
 		}
+		if err == nil {
+			terminal, diagnostic := sandboxDiagnostic(sandbox)
+			if diagnostic != "" {
+				lastDiagnostic = diagnostic
+			}
+			if terminal {
+				return out, fmt.Errorf("Hermes Sandbox %s failed: %s", agentID, lastDiagnostic)
+			}
+			terminal, diagnostic = a.hermesPodDiagnostic(ctx, sandbox, agentID)
+			if diagnostic != "" {
+				lastDiagnostic = diagnostic
+			}
+			if terminal {
+				return out, fmt.Errorf("Hermes Sandbox %s failed: %s", agentID, lastDiagnostic)
+			}
+		}
 		select {
 		case <-ctx.Done():
-			return out, ctx.Err()
+			return out, fmt.Errorf("Hermes Sandbox %s not ready: %s: %w", agentID, lastDiagnostic, ctx.Err())
 		case <-tick.C:
 		}
 	}
+}
+
+func sandboxDiagnostic(sandbox *unstructured.Unstructured) (bool, string) {
+	conditions, _, _ := unstructured.NestedSlice(sandbox.Object, "status", "conditions")
+	diagnostic := ""
+	for _, condition := range conditions {
+		value, ok := condition.(map[string]any)
+		if !ok || value["status"] != "True" && value["status"] != "False" {
+			continue
+		}
+		if observed, ok := value["observedGeneration"].(int64); ok && observed < sandbox.GetGeneration() {
+			continue
+		}
+		reason, _ := value["reason"].(string)
+		message, _ := value["message"].(string)
+		conditionDiagnostic := strings.TrimSpace(reason + ": " + message)
+		conditionType, _ := value["type"].(string)
+		if conditionType == "Finished" && value["status"] == "True" {
+			return true, conditionDiagnostic
+		}
+		if conditionType == "Ready" && value["status"] == "False" {
+			switch reason {
+			case "PodFailed", "PodSucceeded", "SandboxExpired", "SandboxSuspended":
+				return true, conditionDiagnostic
+			}
+			diagnostic = conditionDiagnostic
+		}
+	}
+	return false, diagnostic
+}
+
+func (a *Activities) hermesPodDiagnostic(ctx context.Context, sandbox *unstructured.Unstructured, agentID string) (bool, string) {
+	podName, _, _ := unstructured.NestedString(sandbox.Object, "metadata", "annotations", "agents.x-k8s.io/pod-name")
+	if podName == "" {
+		podName = agentID
+	}
+	pod, err := a.kube.CoreV1().Pods(a.cfg.SandboxNamespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return false, ""
+	}
+	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+		return true, strings.TrimSpace(string(pod.Status.Phase) + ": " + pod.Status.Reason + ": " + pod.Status.Message)
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+			return false, strings.TrimSpace(condition.Reason + ": " + condition.Message)
+		}
+	}
+	for _, status := range append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...) {
+		if status.State.Waiting == nil {
+			continue
+		}
+		diagnostic := strings.TrimSpace(status.Name + ": " + status.State.Waiting.Reason + ": " + status.State.Waiting.Message)
+		if status.State.Waiting.Reason == "InvalidImageName" || status.State.Waiting.Reason == "ErrImageNeverPull" {
+			return true, diagnostic
+		}
+		return false, diagnostic
+	}
+	return false, ""
 }
 
 func (a *Activities) CreateHermesService(ctx context.Context, in CreateHermesServiceInput) (string, error) {

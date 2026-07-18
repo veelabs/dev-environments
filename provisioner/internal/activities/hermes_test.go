@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/testsuite"
@@ -138,6 +139,34 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	require.NoError(t, err)
 	_, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
 	require.NoError(t, err)
+}
+
+func TestAwaitHermesReadyReportsTerminalSandboxFailure(t *testing.T) {
+	ctx := context.Background()
+	dyn := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	sandbox := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "agents.x-k8s.io/v1beta1",
+		"kind":       "Sandbox",
+		"metadata": map[string]any{
+			"name":      "agent-failed-owl",
+			"namespace": "hermes-agents",
+		},
+	}}
+	sandbox, err := dyn.Resource(sandboxGVR).Namespace("hermes-agents").Create(ctx, sandbox, metav1.CreateOptions{})
+	require.NoError(t, err)
+	sandbox.Object["status"] = map[string]any{"conditions": []any{map[string]any{
+		"type": "Finished", "status": "True", "reason": "PodFailed", "message": "Pod failed",
+	}}}
+	_, err = dyn.Resource(sandboxGVR).Namespace("hermes-agents").UpdateStatus(ctx, sandbox, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	a := New(config.Config{SandboxNamespace: "hermes-agents", BaseDomain: "renala.dev"}, dyn, fake.NewClientset())
+
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(time.Second)
+	activityEnv.RegisterActivity(a)
+	_, err = activityEnv.ExecuteActivity(a.AwaitHermesReady, "agent-failed-owl")
+
+	require.ErrorContains(t, err, "PodFailed: Pod failed")
 }
 
 func resourceMustParse(t *testing.T, value string) resource.Quantity {
