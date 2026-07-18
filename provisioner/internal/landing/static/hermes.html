@@ -89,7 +89,7 @@
   function card(agent) {
     const id = escapeHTML(agent.agentId), phase = escapeHTML(agent.phase);
     const running = agent.phase === "running", stopped = agent.phase === "stopped", locked = busy.has(agent.agentId) || transitional(agent.phase);
-    const forget = `<button class="danger" data-action="forget" ${agent.phase === "backup-only" && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
+    const forget = `<button class="danger" data-action="forget" ${stopped && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
     return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}<div class="actions"><button data-action="start" ${running || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || locked ? "disabled" : ""}>Stop</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button>${forget}</div><div class="credentials" hidden></div></article>`;
   }
 

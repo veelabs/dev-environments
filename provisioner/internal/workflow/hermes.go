@@ -22,7 +22,6 @@ const (
 	HermesPhaseRunning     = "running"
 	HermesPhaseStopping    = "stopping"
 	HermesPhaseStopped     = "stopped"
-	HermesPhaseBackupOnly  = "backup-only"
 	HermesPhaseRotating    = "rotating-credentials"
 	HermesPhaseForgetting  = "forgetting"
 	HermesPhaseError       = "error"
