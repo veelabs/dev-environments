@@ -44,6 +44,11 @@ type CreateHermesIngressInput struct {
 	Service string
 }
 
+type HermesResources struct {
+	RuntimePresent bool
+	PVCPresent     bool
+}
+
 func hermesLabels(agentID string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/managed-by": "hermes-provisioner",
@@ -101,6 +106,61 @@ func randomCredential(bytes int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(value), nil
+}
+
+func (a *Activities) RotateHermesCredentials(ctx context.Context, agentID string) error {
+	password, err := randomCredential(24)
+	if err != nil {
+		return err
+	}
+	sessionSecret, err := randomCredential(32)
+	if err != nil {
+		return err
+	}
+	secret, err := a.kube.CoreV1().Secrets(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if secret.StringData == nil {
+		secret.StringData = map[string]string{}
+	}
+	secret.StringData["password"] = password
+	secret.StringData["session-secret"] = sessionSecret
+	_, err = a.kube.CoreV1().Secrets(a.cfg.SandboxNamespace).Update(ctx, secret, metav1.UpdateOptions{})
+	return err
+}
+
+func (a *Activities) DeleteHermesCredentials(ctx context.Context, agentID string) error {
+	err := a.kube.CoreV1().Secrets(a.cfg.SandboxNamespace).Delete(ctx, agentID, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func (a *Activities) InspectHermesResources(ctx context.Context, agentID string) (HermesResources, error) {
+	var out HermesResources
+	if _, err := a.dyn.Resource(sandboxGVR).Namespace(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+		out.RuntimePresent = true
+	} else if !apierrors.IsNotFound(err) {
+		return out, err
+	}
+	if _, err := a.kube.CoreV1().Services(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+		out.RuntimePresent = true
+	} else if !apierrors.IsNotFound(err) {
+		return out, err
+	}
+	if _, err := a.kube.NetworkingV1().Ingresses(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+		out.RuntimePresent = true
+	} else if !apierrors.IsNotFound(err) {
+		return out, err
+	}
+	if _, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+		out.PVCPresent = true
+	} else if !apierrors.IsNotFound(err) {
+		return out, err
+	}
+	return out, nil
 }
 
 func (a *Activities) CreateHermesSandbox(ctx context.Context, agentID string) (string, error) {
@@ -388,4 +448,36 @@ func (a *Activities) DeleteHermesSandbox(ctx context.Context, agentID string) er
 		return nil
 	}
 	return err
+}
+
+func (a *Activities) AwaitHermesRuntimeAbsent(ctx context.Context, agentID string) error {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		activity.RecordHeartbeat(ctx, "waiting for Hermes runtime deletion")
+		present := false
+		if _, err := a.dyn.Resource(sandboxGVR).Namespace(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+			present = true
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		if _, err := a.kube.CoreV1().Services(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+			present = true
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		if _, err := a.kube.NetworkingV1().Ingresses(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{}); err == nil {
+			present = true
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		if !present {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
 }

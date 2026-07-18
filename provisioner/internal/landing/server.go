@@ -6,15 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/kubernetes"
 
 	wf "github.com/veelabs/dev-environments/provisioner/internal/workflow"
 )
@@ -31,6 +33,8 @@ type temporalClient interface {
 	}, error)
 	CountWorkflow(ctx context.Context, request *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error)
 	DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error)
+	ListWorkflow(ctx context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error)
+	SignalWorkflow(ctx context.Context, workflowID, runID, signalName string, arg interface{}) error
 }
 
 // clientAdapter wraps the real client.Client so QueryWorkflow's
@@ -45,8 +49,9 @@ func (a clientAdapter) QueryWorkflow(ctx context.Context, workflowID, runID, que
 
 // Server serves the landing page and its claim API.
 type Server struct {
-	cfg Config
-	tc  temporalClient
+	cfg         Config
+	tc          temporalClient
+	credentials credentialStore
 }
 
 // NewServer builds a Server backed by a real Temporal client.
@@ -54,21 +59,213 @@ func NewServer(cfg Config, tc client.Client) *Server {
 	return &Server{cfg: cfg, tc: clientAdapter{tc}}
 }
 
+func NewHermesServer(cfg Config, tc client.Client, kube kubernetes.Interface) *Server {
+	return &Server{cfg: cfg, tc: clientAdapter{tc}, credentials: kubeCredentialStore{kube: kube, namespace: cfg.HermesNamespace}}
+}
+
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	static, err := fs.Sub(staticFS, "static")
-	if err != nil {
-		panic(fmt.Sprintf("embedded static fs: %v", err)) // impossible: compile-time embed
+	page := "static/index.html"
+	if s.cfg.Kind == "hermes" {
+		page = "static/hermes.html"
 	}
-	mux.Handle("GET /", http.FileServerFS(static))
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+		contents, err := staticFS.ReadFile(page)
+		if err != nil {
+			panic(fmt.Sprintf("embedded landing page: %v", err))
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(contents)
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("POST /api/claim", s.handleClaim)
-	mux.HandleFunc("GET /api/claim/{id}", s.handleStatus)
+	if s.cfg.Kind == "hermes" {
+		mux.HandleFunc("GET /api/agents/name", s.handleHermesName)
+		mux.HandleFunc("GET /api/agents", s.handleHermesList)
+		mux.HandleFunc("POST /api/agents", s.handleHermesCreate)
+		mux.HandleFunc("GET /api/agents/{id}", s.handleHermesStatus)
+		mux.HandleFunc("POST /api/agents/{id}/start", s.handleHermesOperation(wf.HermesOperationStart))
+		mux.HandleFunc("POST /api/agents/{id}/stop", s.handleHermesOperation(wf.HermesOperationStop))
+		mux.HandleFunc("POST /api/agents/{id}/credentials/rotate", s.handleHermesOperation(wf.HermesOperationRotateCredentials))
+		mux.HandleFunc("GET /api/agents/{id}/credentials", s.handleHermesCredentials)
+		mux.HandleFunc("POST /api/agents/{id}/forget", s.handleHermesForget)
+	} else {
+		mux.HandleFunc("POST /api/claim", s.handleClaim)
+		mux.HandleFunc("GET /api/claim/{id}", s.handleStatus)
+	}
 	return mux
+}
+
+func (s *Server) handleHermesCredentials(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validHermesID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-name"})
+		return
+	}
+	if s.credentials == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "credentials-unavailable"})
+		return
+	}
+	credentials, err := s.credentials.Get(r.Context(), id)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "credentials-not-found"})
+			return
+		}
+		log.Printf("read Hermes credentials %s: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "kubernetes", "message": "Could not read dashboard credentials. Try again shortly."})
+		return
+	}
+	writeJSON(w, http.StatusOK, credentials)
+}
+
+func (s *Server) handleHermesList(w http.ResponseWriter, r *http.Request) {
+	request := &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: s.cfg.TemporalNamespace,
+		Query:     "WorkflowType = 'ProvisionHermesAgent' AND ExecutionStatus = 'Running'",
+		PageSize:  100,
+	}
+	statuses := []wf.HermesStatus{}
+	for {
+		response, err := s.tc.ListWorkflow(r.Context(), request)
+		if err != nil {
+			log.Printf("list Hermes agents: %v", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not list agents. Try again shortly."})
+			return
+		}
+		for _, execution := range response.Executions {
+			id := execution.GetExecution().GetWorkflowId()
+			value, err := s.tc.QueryWorkflow(r.Context(), id, "", "status")
+			if err != nil {
+				log.Printf("query Hermes agent %s: %v", id, err)
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not read agent status. Try again shortly."})
+				return
+			}
+			var status wf.HermesStatus
+			if err := value.Get(&status); err != nil {
+				log.Printf("decode Hermes agent %s status: %v", id, err)
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not read agent status. Try again shortly."})
+				return
+			}
+			statuses = append(statuses, status)
+		}
+		if len(response.NextPageToken) == 0 {
+			break
+		}
+		request.NextPageToken = response.NextPageToken
+	}
+	writeJSON(w, http.StatusOK, statuses)
+}
+
+func validHermesID(id string) bool {
+	if !strings.HasPrefix(id, "agent-") {
+		return false
+	}
+	validated, err := wf.HermesAgentID(strings.TrimPrefix(id, "agent-"))
+	return err == nil && validated == id
+}
+
+func (s *Server) handleHermesStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validHermesID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-name"})
+		return
+	}
+	value, err := s.tc.QueryWorkflow(r.Context(), id, "", "status")
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown-agent"})
+			return
+		}
+		log.Printf("query Hermes agent %s: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not read agent status. Try again shortly."})
+		return
+	}
+	var status wf.HermesStatus
+	if err := value.Get(&status); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleHermesOperation(operation string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.signalHermesOperation(w, r, wf.HermesOperation{Type: operation})
+	}
+}
+
+func (s *Server) handleHermesForget(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var input struct {
+		Confirmation string `json:"confirmation"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil || input.Confirmation != id {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirmation", "message": "Type the full agent ID to confirm Forget."})
+		return
+	}
+	s.signalHermesOperation(w, r, wf.HermesOperation{Type: wf.HermesOperationForget, Confirmation: input.Confirmation})
+}
+
+func (s *Server) signalHermesOperation(w http.ResponseWriter, r *http.Request, operation wf.HermesOperation) {
+	id := r.PathValue("id")
+	if !validHermesID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-name"})
+		return
+	}
+	if err := s.tc.SignalWorkflow(r.Context(), id, "", wf.HermesOperationSignal, operation); err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown-agent"})
+			return
+		}
+		log.Printf("signal Hermes agent %s: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not request the lifecycle operation. Try again shortly."})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+func (s *Server) handleHermesName(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"name": randomName()})
+}
+
+func (s *Server) handleHermesCreate(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var request struct {
+		Name string `json:"name"`
+		Soul string `json:"soul,omitempty"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-request", "message": "Expected a name and optional SOUL.md text."})
+		return
+	}
+	agentID, err := wf.HermesAgentID(request.Name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-name", "message": err.Error()})
+		return
+	}
+	input := wf.HermesInput{Name: strings.TrimPrefix(agentID, "agent-"), Soul: request.Soul}
+	_, err = s.tc.ExecuteWorkflow(r.Context(), client.StartWorkflowOptions{
+		ID: agentID, TaskQueue: s.cfg.TaskQueue,
+	}, wf.ProvisionHermesAgent, input)
+	if err != nil {
+		var already *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &already) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "name-taken", "message": "An agent with that name already exists."})
+			return
+		}
+		log.Printf("create Hermes agent %s: %v", agentID, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not start the agent workflow. Try again shortly."})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"id": agentID})
 }
 
 // claimResponse is returned when a devbox claim is accepted.

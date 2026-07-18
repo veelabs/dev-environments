@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes agents</title>
+<style>
+  :root { --ink:#18172a; --muted:#6c6880; --paper:#f4f0e8; --card:#fffdf8; --line:#d9d2c4; --violet:#5040a8; --mint:#1f806c; --red:#a43838; --shadow:0 18px 50px #27203a17; }
+  * { box-sizing:border-box }
+  body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.5 ui-sans-serif,system-ui,sans-serif; }
+  body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.32; background-image:radial-gradient(#5040a822 1px,transparent 1px); background-size:22px 22px; mask-image:linear-gradient(to bottom,#000,transparent 65%); }
+  main { position:relative; width:min(1120px,calc(100% - 32px)); margin:0 auto; padding:54px 0 80px; }
+  header { display:flex; justify-content:space-between; gap:24px; align-items:end; margin-bottom:30px; }
+  .eyebrow { color:var(--violet); font:700 12px/1 ui-monospace,monospace; letter-spacing:.14em; text-transform:uppercase; }
+  h1 { margin:8px 0 4px; font:700 clamp(34px,6vw,62px)/.95 Georgia,serif; letter-spacing:-.04em; }
+  header p { margin:0; color:var(--muted); max-width:52ch; }
+  .health { align-self:start; border:1px solid var(--line); border-radius:99px; background:#fff9; padding:7px 12px; color:var(--mint); font:700 12px ui-monospace,monospace; }
+  .layout { display:grid; grid-template-columns:minmax(280px,380px) 1fr; gap:22px; align-items:start; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:18px; box-shadow:var(--shadow); }
+  .create { padding:24px; position:sticky; top:18px; }
+  h2 { margin:0 0 4px; font:700 22px Georgia,serif; }
+  .hint { margin:0 0 20px; color:var(--muted); font-size:13px; }
+  label { display:block; margin:15px 0 6px; font-weight:700; font-size:13px; }
+  input,textarea { width:100%; border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; outline:none; }
+  input { font-family:ui-monospace,monospace; }
+  textarea { min-height:220px; resize:vertical; line-height:1.55; }
+  input:focus,textarea:focus { border-color:var(--violet); box-shadow:0 0 0 3px #5040a817; }
+  button { border:0; border-radius:9px; padding:9px 12px; color:var(--ink); background:#ebe6dc; font:700 13px inherit; cursor:pointer; }
+  button:hover { filter:brightness(.97); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .primary { width:100%; margin-top:18px; padding:12px 16px; color:#fff; background:var(--violet); }
+  .form-error,.list-error { color:var(--red); min-height:1.5em; margin-top:10px; font-size:13px; }
+  .catalog-head { display:flex; justify-content:space-between; align-items:center; margin:2px 2px 12px; }
+  .catalog-head button { background:transparent; color:var(--violet); }
+  #agents { display:grid; gap:12px; }
+  .empty { padding:48px 24px; text-align:center; color:var(--muted); }
+  .agent { padding:19px; }
+  .agent-head { display:flex; justify-content:space-between; gap:12px; align-items:start; }
+  .agent h3 { margin:0; font:700 18px ui-monospace,monospace; }
+  .phase { flex:none; border-radius:99px; padding:5px 9px; background:#eee9df; color:var(--muted); font:700 11px ui-monospace,monospace; }
+  .phase.running { color:var(--mint); background:#dcefe9; }
+  .phase.error { color:var(--red); background:#f6dddd; }
+  .meta { color:var(--muted); font:12px ui-monospace,monospace; overflow-wrap:anywhere; margin:8px 0 0; }
+  .error { color:var(--red); margin:10px 0 0; font-size:13px; }
+  .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  .actions .danger { color:var(--red); margin-left:auto; }
+  .credentials { margin-top:12px; padding:12px; border-radius:10px; background:#f0ece3; font:13px ui-monospace,monospace; overflow-wrap:anywhere; }
+  .credentials button { margin-top:8px; }
+  a { color:var(--violet); font-weight:700; }
+  @media (max-width:780px) { main{padding-top:28px} header{align-items:start} .layout{grid-template-columns:1fr} .create{position:static} textarea{min-height:170px} .actions .danger{margin-left:0} }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div><div class="eyebrow">Single-operator control plane</div><h1>Hermes agents</h1><p>Create a durable identity, shape it with SOUL.md, and control its runtime without touching Kubernetes or Temporal.</p></div>
+    <div class="health">● service ready</div>
+  </header>
+  <div class="layout">
+    <form class="panel create" id="create-form">
+      <h2>New identity</h2><p class="hint">Provider and model credentials are configured later in Hermes.</p>
+      <label for="name">Agent name</label><input id="name" name="name" required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxlength="57" autocomplete="off">
+      <label for="soul">SOUL.md</label><textarea id="soul" name="soul" placeholder="# Purpose&#10;&#10;You are..."></textarea>
+      <button class="primary" type="submit">Create agent</button><div class="form-error" id="form-error" role="alert"></div>
+    </form>
+    <section>
+      <div class="catalog-head"><div><h2>Entity catalog</h2><span class="hint">Durable Temporal workflows</span></div><button id="refresh">Refresh</button></div>
+      <div class="list-error" id="list-error" role="alert"></div><div id="agents"><div class="panel empty">No agents yet.</div></div>
+    </section>
+  </div>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const busy = new Set();
+  let creatingID = "";
+
+  async function json(url, options) {
+    const response = await fetch(url, { cache:"no-store", ...options, headers:{"Content-Type":"application/json", ...(options && options.headers)} });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || body.error || `Request failed (${response.status})`);
+    return body;
+  }
+
+  const escapeHTML = value => String(value || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+  const transitional = phase => ["storage","credentials","starting","wiring","verifying","stopping","rotating-credentials","forgetting"].includes(phase);
+
+  function card(agent) {
+    const id = escapeHTML(agent.agentId), phase = escapeHTML(agent.phase);
+    const running = agent.phase === "running", stopped = agent.phase === "stopped", locked = busy.has(agent.agentId) || transitional(agent.phase);
+    const forget = `<button class="danger" data-action="forget" ${stopped && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
+    return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}<div class="actions"><button data-action="start" ${running || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || locked ? "disabled" : ""}>Stop</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button>${forget}</div><div class="credentials" hidden></div></article>`;
+  }
+
+  async function load() {
+    try {
+      let agents = await json("/api/agents");
+      if (creatingID && !agents.some(a => a.agentId === creatingID)) {
+        try { agents = [await json(`/api/agents/${encodeURIComponent(creatingID)}`), ...agents]; }
+        catch (_) { agents = [{agentId:creatingID, phase:"storage", lastError:"Workflow accepted; waiting for its status query to register."}, ...agents]; }
+      } else if (creatingID) { creatingID = ""; }
+      $("agents").innerHTML = agents.length ? agents.map(card).join("") : `<div class="panel empty">No agents yet. Create the first identity.</div>`;
+      $("list-error").textContent = "";
+    } catch (error) { $("list-error").textContent = error.message; }
+  }
+
+  $("create-form").addEventListener("submit", async event => {
+    event.preventDefault(); $("form-error").textContent = "";
+    const button = event.currentTarget.querySelector("button"); button.disabled = true;
+    try {
+      const result = await json("/api/agents", { method:"POST", body:JSON.stringify({name:$("name").value, soul:$("soul").value}) });
+      creatingID = result.id; $("soul").value = ""; await suggest(); await load();
+    } catch (error) { $("form-error").textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+
+  $("agents").addEventListener("click", async event => {
+    const button = event.target.closest("button[data-action]"); if (!button) return;
+    const article = button.closest(".agent"), id = article.dataset.id, action = button.dataset.action;
+    try {
+      if (action === "reveal") {
+        const credentials = await json(`/api/agents/${encodeURIComponent(id)}/credentials`);
+        const box = article.querySelector(".credentials"); box.hidden = false;
+        box.innerHTML = `username: ${escapeHTML(credentials.username)}<br>password: ${escapeHTML(credentials.password)}<br><button data-copy="${escapeHTML(credentials.username + ":" + credentials.password)}">Copy username:password</button>`;
+        return;
+      }
+      if (action === "forget") {
+        const confirmation = prompt(`Type ${id} to forget this entity.`); if (confirmation !== id) return;
+        await json(`/api/agents/${encodeURIComponent(id)}/forget`, {method:"POST", body:JSON.stringify({confirmation})});
+      } else {
+        const path = action === "rotate" ? "credentials/rotate" : action;
+        busy.add(id); await json(`/api/agents/${encodeURIComponent(id)}/${path}`, {method:"POST", body:"{}"});
+      }
+      await load();
+    } catch (error) { $("list-error").textContent = error.message; }
+    finally { busy.delete(id); }
+  });
+
+  $("agents").addEventListener("click", async event => {
+    const copy = event.target.closest("button[data-copy]"); if (!copy) return;
+    await navigator.clipboard.writeText(copy.dataset.copy); copy.textContent = "Copied";
+  });
+  async function suggest() { try { $("name").value = (await json("/api/agents/name")).name; } catch (_) {} }
+  $("refresh").addEventListener("click", load);
+  suggest(); load(); setInterval(load, 2500);
+})();
+</script>
+</body>
+</html>
