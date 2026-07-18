@@ -34,6 +34,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: HERMES_API_SECRET
+              value: {{ .Values.hermes.apiSecret | quote }}
+            - name: HERMES_API_BASE_URL
+              value: {{ printf "http://%s:%v" (required "router.hostname is required" .Values.router.hostname) .Values.router.nodePort | quote }}
           readinessProbe:
             httpGet:
               path: /healthz

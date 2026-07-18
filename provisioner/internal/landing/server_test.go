@@ -47,11 +47,16 @@ type fakeSignal struct {
 
 type fakeCredentialStore struct {
 	credentials DashboardCredentials
+	apiKey      string
 	err         error
 }
 
 func (f fakeCredentialStore) Get(context.Context, string) (DashboardCredentials, error) {
 	return f.credentials, f.err
+}
+
+func (f fakeCredentialStore) GetAPIKey(context.Context, string) (string, error) {
+	return f.apiKey, f.err
 }
 
 func (f *fakeTemporal) ExecuteWorkflow(_ context.Context, opts client.StartWorkflowOptions, _ interface{}, args ...interface{}) (client.WorkflowRun, error) {
@@ -156,7 +161,7 @@ func doJSONBody(t *testing.T, h http.Handler, method, path, body string) (*httpt
 
 func newHermesTestServer(f *fakeTemporal) *Server {
 	return &Server{
-		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default"},
+		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default", HermesAPISecret: "hermes-api", HermesAPIBaseURL: "http://homelab-server.example.ts.net:30864"},
 		tc:  f,
 	}
 }
@@ -247,6 +252,17 @@ func TestHermesCredentialsAreRevealedWithoutCaching(t *testing.T) {
 	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 	require.Equal(t, "hermes", body["username"])
 	require.Equal(t, "generated-password", body["password"])
+}
+
+func TestHermesAPIAccessIsRevealedWithoutCaching(t *testing.T) {
+	s := newHermesTestServer(&fakeTemporal{})
+	s.credentials = fakeCredentialStore{apiKey: "platform-token"}
+	rec, body := doJSON(t, s.Handler(), http.MethodGet, "/api/access")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	require.Equal(t, "platform-token", body["token"])
+	require.Equal(t, "http://homelab-server.example.ts.net:30864", body["baseUrl"])
 }
 
 func workflowInfo(id string) *workflowpb.WorkflowExecutionInfo {
@@ -368,6 +384,10 @@ func TestServesDedicatedHermesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Header().Get("Content-Type"), "text/html")
 	require.Contains(t, rec.Body.String(), "Hermes agents")
 	require.Contains(t, rec.Body.String(), "SOUL.md")
+	require.Contains(t, rec.Body.String(), "Reveal API token")
+	require.Contains(t, rec.Body.String(), "X-Hermes-Agent")
+	require.Contains(t, rec.Body.String(), "Authorization")
+	require.NotContains(t, rec.Body.String(), `\n+`)
 	require.NotContains(t, rec.Body.String(), "provider key")
 }
 

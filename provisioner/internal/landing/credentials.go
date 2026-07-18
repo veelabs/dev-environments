@@ -15,6 +15,22 @@ type DashboardCredentials struct {
 
 type credentialStore interface {
 	Get(context.Context, string) (DashboardCredentials, error)
+	GetAPIKey(context.Context, string) (string, error)
+}
+
+func (s kubeCredentialStore) GetAPIKey(ctx context.Context, secretName string) (string, error) {
+	secret, err := s.kube.CoreV1().Secrets(s.namespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	key := string(secret.Data["key"])
+	if key == "" {
+		key = secret.StringData["key"]
+	}
+	if key == "" {
+		return "", fmt.Errorf("API Secret %s is missing key", secretName)
+	}
+	return key, nil
 }
 
 type kubeCredentialStore struct {

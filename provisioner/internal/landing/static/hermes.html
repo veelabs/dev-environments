@@ -46,6 +46,11 @@
   .actions .danger { color:var(--red); margin-left:auto; }
   .credentials { margin-top:12px; padding:12px; border-radius:10px; background:#f0ece3; font:13px ui-monospace,monospace; overflow-wrap:anywhere; }
   .credentials button { margin-top:8px; }
+  .api-access { margin-bottom:22px; padding:20px; }
+  .api-access-head { display:flex; justify-content:space-between; gap:16px; align-items:center; }
+  .api-details { margin-top:14px; }
+  pre { margin:0; padding:14px; overflow:auto; border-radius:10px; background:#211f30; color:#f4f0e8; font:12px/1.55 ui-monospace,monospace; white-space:pre-wrap; }
+  .api-details button { margin-top:8px; }
   a { color:var(--violet); font-weight:700; }
   @media (max-width:780px) { main{padding-top:28px} header{align-items:start} .layout{grid-template-columns:1fr} .create{position:static} textarea{min-height:170px} .actions .danger{margin-left:0} }
 </style>
@@ -56,6 +61,10 @@
     <div><div class="eyebrow">Single-operator control plane</div><h1>Hermes agents</h1><p>Create a durable identity, shape it with SOUL.md, and control its runtime without touching Kubernetes or Temporal.</p></div>
     <div class="health">● service ready</div>
   </header>
+  <section class="panel api-access">
+    <div class="api-access-head"><div><h2>Private agent API</h2><p class="hint">One tailnet endpoint and token; select the running agent with <code>X-Hermes-Agent</code>.</p></div><button id="reveal-api">Reveal API token</button></div>
+    <div class="api-details" id="api-details" hidden><pre id="api-example"></pre><button id="copy-api">Copy request</button></div>
+  </section>
   <div class="layout">
     <form class="panel create" id="create-form">
       <h2>New identity</h2><p class="hint">Provider and model credentials are configured later in Hermes.</p>
@@ -140,6 +149,17 @@
   $("agents").addEventListener("click", async event => {
     const copy = event.target.closest("button[data-copy]"); if (!copy) return;
     await navigator.clipboard.writeText(copy.dataset.copy); copy.textContent = "Copied";
+  });
+  $("reveal-api").addEventListener("click", async () => {
+    try {
+      const access = await json("/api/access");
+      const agent = document.querySelector(".agent")?.dataset.id || "agent-calm-fox";
+      $("api-example").textContent = `curl -N '${access.baseUrl}/v1/chat/completions' \\\n  -H 'X-Hermes-Agent: ${agent}' \\\n  -H 'Authorization: Bearer ${access.token}' \\\n  -H 'Content-Type: application/json' \\\n  --data '{"model":"hermes","messages":[{"role":"user","content":"Hello"}],"stream":true}'`;
+      $("api-details").hidden = false;
+    } catch (error) { $("list-error").textContent = error.message; }
+  });
+  $("copy-api").addEventListener("click", async event => {
+    await navigator.clipboard.writeText($("api-example").textContent); event.currentTarget.textContent = "Copied";
   });
   async function suggest() { try { $("name").value = (await json("/api/agents/name")).name; } catch (_) {} }
   $("refresh").addEventListener("click", load);

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -14,9 +15,24 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/landing"
+	"github.com/veelabs/dev-environments/provisioner/internal/router"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if os.Getenv("LANDING_KIND") == "router" {
+		cfg, err := router.LoadConfig()
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		if err := router.New(cfg, nil).Run(ctx); err != nil {
+			log.Fatalf("API router: %v", err)
+		}
+		return
+	}
+
 	cfg, err := landing.LoadConfig()
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -30,9 +46,6 @@ func main() {
 		log.Fatalf("temporal dial %s: %v", cfg.TemporalHostPort, err)
 	}
 	defer tc.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	server := landing.NewServer(cfg, tc)
 	if cfg.Kind == "hermes" {

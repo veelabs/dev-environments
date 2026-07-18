@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 	if s.cfg.Kind == "hermes" {
+		mux.HandleFunc("GET /api/access", s.handleHermesAPIAccess)
 		mux.HandleFunc("GET /api/agents/name", s.handleHermesName)
 		mux.HandleFunc("GET /api/agents", s.handleHermesList)
 		mux.HandleFunc("POST /api/agents", s.handleHermesCreate)
@@ -97,6 +98,20 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /api/claim/{id}", s.handleStatus)
 	}
 	return mux
+}
+
+func (s *Server) handleHermesAPIAccess(w http.ResponseWriter, r *http.Request) {
+	if s.credentials == nil || s.cfg.HermesAPIBaseURL == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "api-access-unavailable"})
+		return
+	}
+	key, err := s.credentials.GetAPIKey(r.Context(), s.cfg.HermesAPISecret)
+	if err != nil {
+		log.Printf("read Hermes API key: %v", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "kubernetes", "message": "Could not read the API token. Try again shortly."})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"baseUrl": s.cfg.HermesAPIBaseURL, "token": key})
 }
 
 func (s *Server) handleHermesCredentials(w http.ResponseWriter, r *http.Request) {
