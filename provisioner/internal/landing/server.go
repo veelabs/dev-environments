@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 	wf "github.com/veelabs/dev-environments/provisioner/internal/workflow"
 )
 
@@ -47,11 +49,22 @@ func (a clientAdapter) QueryWorkflow(ctx context.Context, workflowID, runID, que
 	return a.Client.QueryWorkflow(ctx, workflowID, runID, queryType, args...)
 }
 
+type profileStore interface {
+	Stage(context.Context, profilebundle.Bundle) (profilebundle.Ref, error)
+	Delete(context.Context, profilebundle.Ref) error
+}
+
+type expiringProfileStore interface {
+	DeleteExpired(context.Context, time.Time) error
+}
+
 // Server serves the landing page and its claim API.
 type Server struct {
-	cfg         Config
-	tc          temporalClient
-	credentials credentialStore
+	cfg          Config
+	tc           temporalClient
+	credentials  credentialStore
+	profileStore profileStore
+	acquireGit   func(context.Context, string, profilebundle.GitOptions) (profilebundle.Bundle, error)
 }
 
 // NewServer builds a Server backed by a real Temporal client.
@@ -60,7 +73,12 @@ func NewServer(cfg Config, tc client.Client) *Server {
 }
 
 func NewHermesServer(cfg Config, tc client.Client, kube kubernetes.Interface) *Server {
-	return &Server{cfg: cfg, tc: clientAdapter{tc}, credentials: kubeCredentialStore{kube: kube, namespace: cfg.HermesNamespace}}
+	return &Server{
+		cfg: cfg, tc: clientAdapter{tc},
+		credentials:  kubeCredentialStore{kube: kube, namespace: cfg.HermesNamespace},
+		profileStore: profilebundle.NewStore(kube, cfg.HermesNamespace),
+		acquireGit:   profilebundle.AcquireGit,
+	}
 }
 
 // Handler returns the HTTP routes.
@@ -250,27 +268,102 @@ func (s *Server) handleHermesName(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleHermesCreate(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var request struct {
-		Name string `json:"name"`
-		Soul string `json:"soul,omitempty"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-request", "message": "Expected a name and optional SOUL.md text."})
 		return
 	}
-	agentID, err := wf.HermesAgentID(request.Name)
+	defer r.MultipartForm.RemoveAll()
+
+	name := r.FormValue("name")
+	soul := r.FormValue("soul")
+	agentID, err := wf.HermesAgentID(name)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-name", "message": err.Error()})
 		return
 	}
-	input := wf.HermesInput{Name: strings.TrimPrefix(agentID, "agent-"), Soul: request.Soul}
+
+	gitValues := r.MultipartForm.Value["gitUrl"]
+	if len(gitValues) > 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source-conflict", "message": "Provide at most one Git URL."})
+		return
+	}
+	gitURL := strings.TrimSpace(r.FormValue("gitUrl"))
+	files := r.MultipartForm.File["zip"]
+	if len(files) > 1 {
+		writeInvalidZIP(w, errors.New("upload exactly one ZIP file"))
+		return
+	}
+	var zipFilePresent bool
+	if len(files) == 1 {
+		zipFilePresent = files[0].Filename != "" || files[0].Size != 0
+	}
+	if gitURL != "" && zipFilePresent {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source-conflict", "message": "Choose either a Git URL or a ZIP upload, not both."})
+		return
+	}
+
+	input := wf.HermesInput{Name: strings.TrimPrefix(agentID, "agent-")}
+	if gitURL == "" && !zipFilePresent {
+		input.Soul = soul
+	} else {
+		var bundle profilebundle.Bundle
+		if gitURL != "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			bundle, err = s.acquireGit(ctx, gitURL, profilebundle.GitOptions{AllowedHosts: s.cfg.HermesGitAllowedHosts, Timeout: 30 * time.Second})
+			cancel()
+			if err != nil {
+				writeInvalidGit(w, err)
+				return
+			}
+		} else {
+			file, openErr := files[0].Open()
+			if openErr != nil {
+				writeInvalidZIP(w, openErr)
+				return
+			}
+			contents, readErr := io.ReadAll(file)
+			closeErr := file.Close()
+			if readErr != nil || closeErr != nil {
+				writeInvalidZIP(w, errors.Join(readErr, closeErr))
+				return
+			}
+			bundle, err = profilebundle.ParseZIP(contents)
+			if err != nil {
+				writeInvalidZIP(w, err)
+				return
+			}
+		}
+		bundle, err = bundle.ApplySoul(soul)
+		if err != nil {
+			if gitURL != "" {
+				writeInvalidGit(w, err)
+			} else {
+				writeInvalidZIP(w, err)
+			}
+			return
+		}
+		ref, stageErr := s.profileStore.Stage(r.Context(), bundle)
+		if stageErr != nil {
+			log.Printf("stage Hermes profile for %s: %v", agentID, stageErr)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "kubernetes", "message": "Could not stage the profile distribution. Try again shortly."})
+			return
+		}
+		input.Seed = &ref
+	}
+
 	_, err = s.tc.ExecuteWorkflow(r.Context(), client.StartWorkflowOptions{
 		ID: agentID, TaskQueue: s.cfg.TaskQueue,
 	}, wf.ProvisionHermesAgent, input)
 	if err != nil {
+		if input.Seed != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+			cleanupErr := s.profileStore.Delete(cleanupCtx, *input.Seed)
+			cancel()
+			if cleanupErr != nil {
+				log.Printf("delete staged Hermes profile %s after workflow start failed: %v", input.Seed.ID, cleanupErr)
+			}
+		}
 		var already *serviceerror.WorkflowExecutionAlreadyStarted
 		if errors.As(err, &already) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "name-taken", "message": "An agent with that name already exists."})
@@ -281,6 +374,14 @@ func (s *Server) handleHermesCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": agentID})
+}
+
+func writeInvalidZIP(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-zip", "message": "ZIP rejected: " + err.Error()})
+}
+
+func writeInvalidGit(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-git", "message": "Git source rejected: " + err.Error()})
 }
 
 // claimResponse is returned when a devbox claim is accepted.
@@ -416,6 +517,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 // Run serves HTTP until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if store, ok := s.profileStore.(expiringProfileStore); ok {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				if err := store.DeleteExpired(sweepCtx, time.Now()); err != nil && ctx.Err() == nil {
+					log.Printf("delete expired Hermes profile staging: %v", err)
+				}
+				cancel()
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	srv := &http.Server{
 		Addr:              s.cfg.ListenAddr,
 		Handler:           s.Handler(),

@@ -1,8 +1,13 @@
 package landing
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +22,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 	wf "github.com/veelabs/dev-environments/provisioner/internal/workflow"
 )
 
@@ -49,6 +55,24 @@ type fakeCredentialStore struct {
 	credentials DashboardCredentials
 	apiKey      string
 	err         error
+}
+
+type fakeProfileStore struct {
+	staged    []profilebundle.Bundle
+	ref       profilebundle.Ref
+	stageErr  error
+	deleted   []profilebundle.Ref
+	deleteErr error
+}
+
+func (f *fakeProfileStore) Stage(_ context.Context, bundle profilebundle.Bundle) (profilebundle.Ref, error) {
+	f.staged = append(f.staged, bundle)
+	return f.ref, f.stageErr
+}
+
+func (f *fakeProfileStore) Delete(_ context.Context, ref profilebundle.Ref) error {
+	f.deleted = append(f.deleted, ref)
+	return f.deleteErr
 }
 
 func (f fakeCredentialStore) Get(context.Context, string) (DashboardCredentials, error) {
@@ -159,9 +183,59 @@ func doJSONBody(t *testing.T, h http.Handler, method, path, body string) (*httpt
 	return rec, response
 }
 
+type multipartUpload struct {
+	filename string
+	contents []byte
+}
+
+func doMultipart(t *testing.T, h http.Handler, fields map[string]string, upload *multipartUpload) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for name, value := range fields {
+		require.NoError(t, writer.WriteField(name, value))
+	}
+	if upload != nil {
+		part, err := writer.CreateFormFile("zip", upload.filename)
+		require.NoError(t, err)
+		_, err = part.Write(upload.contents)
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	req := httptest.NewRequest(http.MethodPost, "/api/agents", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+	return rec, response
+}
+
+func hermesProfileZIP(t *testing.T, distributionName, soul string) []byte {
+	t.Helper()
+	return zipFiles(t, map[string]string{
+		"distribution.yaml": "name: " + distributionName + "\n",
+		"SOUL.md":           soul,
+	})
+}
+
+func zipFiles(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	writer := zip.NewWriter(&body)
+	for name, contents := range files {
+		part, err := writer.Create(name)
+		require.NoError(t, err)
+		_, err = io.WriteString(part, contents)
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	return body.Bytes()
+}
+
 func newHermesTestServer(f *fakeTemporal) *Server {
 	return &Server{
-		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default", HermesAPISecret: "hermes-api", HermesAPIBaseURL: "http://homelab-server.example.ts.net:30864"},
+		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default", HermesAPISecret: "hermes-api", HermesAPIBaseURL: "http://homelab-server.example.ts.net:30864", HermesGitAllowedHosts: []string{"github.com"}},
 		tc:  f,
 	}
 }
@@ -170,22 +244,199 @@ func TestHermesCreationUsesStableValidatedIdentity(t *testing.T) {
 	f := &fakeTemporal{}
 	h := newHermesTestServer(f).Handler()
 
-	rec, body := doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"calm-fox","soul":"# Calm Fox\n"}`)
+	rec, body := doMultipart(t, h, map[string]string{"name": "calm-fox", "soul": "# Calm Fox\n", "gitUrl": "   "}, nil)
 	require.Equal(t, http.StatusAccepted, rec.Code)
 	require.Equal(t, "agent-calm-fox", body["id"])
 	require.Equal(t, "agent-calm-fox", f.startedOpts[0].ID)
 	require.Equal(t, "hermes-agents", f.startedOpts[0].TaskQueue)
 	require.Equal(t, wf.HermesInput{Name: "calm-fox", Soul: "# Calm Fox\n"}, f.startedHermes[0])
 
-	rec, body = doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"Not DNS safe"}`)
+	rec, body = doMultipart(t, h, map[string]string{"name": "Not DNS safe", "gitUrl": "https://github.com/org/profile"}, &multipartUpload{filename: "profile.zip", contents: []byte("not a zip")})
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Equal(t, "invalid-name", body["error"])
 	require.Len(t, f.startedOpts, 1)
+}
 
-	rec, body = doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"bold-yak","initialized":true}`)
+func TestHermesCreationRejectsGitAndZIPBeforeAcquisition(t *testing.T) {
+	f := &fakeTemporal{}
+	store := &fakeProfileStore{}
+	acquired := false
+	s := newHermesTestServer(f)
+	s.profileStore = store
+	s.acquireGit = func(context.Context, string, profilebundle.GitOptions) (profilebundle.Bundle, error) {
+		acquired = true
+		return profilebundle.Bundle{}, nil
+	}
+
+	rec, body := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox", "gitUrl": "https://github.com/org/profile"}, &multipartUpload{filename: "profile.zip", contents: hermesProfileZIP(t, "other-name", "old")})
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "source-conflict", body["error"])
+	require.False(t, acquired)
+	require.Empty(t, store.staged)
+	require.Empty(t, f.startedHermes)
+}
+
+func TestHermesCreationRejectsRepeatedGitSources(t *testing.T) {
+	f := &fakeTemporal{}
+	var request bytes.Buffer
+	writer := multipart.NewWriter(&request)
+	require.NoError(t, writer.WriteField("name", "calm-fox"))
+	require.NoError(t, writer.WriteField("gitUrl", "https://github.com/org/one"))
+	require.NoError(t, writer.WriteField("gitUrl", "https://github.com/org/two"))
+	require.NoError(t, writer.Close())
+	req := httptest.NewRequest(http.MethodPost, "/api/agents", &request)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	newHermesTestServer(f).Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), `"error":"source-conflict"`)
+	require.Empty(t, f.startedHermes)
+}
+
+func TestHermesCreationStagesZIPWithExplicitSoulAndIdentity(t *testing.T) {
+	f := &fakeTemporal{}
+	ref := profilebundle.Ref{ID: "seed-123", Parts: 1, Digest: "digest"}
+	store := &fakeProfileStore{ref: ref}
+	s := newHermesTestServer(f)
+	s.profileStore = store
+
+	rec, body := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox", "soul": "# Explicit\n"}, &multipartUpload{filename: "profile.zip", contents: hermesProfileZIP(t, "distribution-name", "# Distribution\n")})
+
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Equal(t, "agent-calm-fox", body["id"])
+	require.Len(t, store.staged, 1)
+	var stagedSoul string
+	for _, file := range store.staged[0].Files {
+		if file.Path == "SOUL.md" {
+			stagedSoul = string(file.Content)
+		}
+	}
+	require.Equal(t, "# Explicit\n", stagedSoul)
+	require.Equal(t, "agent-calm-fox", f.startedOpts[0].ID)
+	require.Equal(t, wf.HermesInput{Name: "calm-fox", Seed: &ref}, f.startedHermes[0], "only the staged ref should enter Temporal")
+}
+
+func TestHermesCreationPreservesDistributionSoulWhenFormSoulIsEmpty(t *testing.T) {
+	f := &fakeTemporal{}
+	ref := profilebundle.Ref{ID: "seed-123", Parts: 1}
+	store := &fakeProfileStore{ref: ref}
+	s := newHermesTestServer(f)
+	s.profileStore = store
+
+	rec, _ := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox", "soul": ""}, &multipartUpload{filename: "profile.zip", contents: hermesProfileZIP(t, "profile", "distribution soul")})
+
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	for _, file := range store.staged[0].Files {
+		if file.Path == "SOUL.md" {
+			require.Equal(t, "distribution soul", string(file.Content))
+			return
+		}
+	}
+	t.Fatal("staged profile has no SOUL.md")
+}
+
+func TestHermesCreationRejectsInvalidZIPWithoutWorkflow(t *testing.T) {
+	invalid := map[string][]byte{
+		"empty":     {},
+		"malformed": []byte("not a zip"),
+		"attack":    zipFiles(t, map[string]string{"distribution.yaml": "name: profile\n", "../SOUL.md": "escape"}),
+	}
+	for name, contents := range invalid {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeTemporal{}
+			store := &fakeProfileStore{}
+			s := newHermesTestServer(f)
+			s.profileStore = store
+
+			rec, body := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox"}, &multipartUpload{filename: "profile.zip", contents: contents})
+
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			require.Equal(t, "invalid-zip", body["error"])
+			require.Contains(t, body["message"], "ZIP rejected:")
+			require.Empty(t, store.staged)
+			require.Empty(t, f.startedHermes)
+		})
+	}
+}
+
+func TestHermesCreationBoundsTheFullMultipartRequest(t *testing.T) {
+	f := &fakeTemporal{}
+	rec, body := doMultipart(t, newHermesTestServer(f).Handler(), map[string]string{"name": "calm-fox", "soul": strings.Repeat("x", 2<<20)}, nil)
+
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Equal(t, "invalid-request", body["error"])
-	require.Len(t, f.startedOpts, 1)
+	require.Empty(t, f.startedHermes)
+}
+
+func TestHermesCreationDeletesStageOnTemporalErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		statusCode int
+		errorCode  string
+	}{
+		{name: "name collision", err: serviceerror.NewWorkflowExecutionAlreadyStarted("taken", "", ""), statusCode: http.StatusConflict, errorCode: "name-taken"},
+		{name: "Temporal unavailable", err: serviceerror.NewUnavailable("down"), statusCode: http.StatusBadGateway, errorCode: "temporal"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := &fakeTemporal{startErrs: []error{test.err}}
+			ref := profilebundle.Ref{ID: "seed-123", Parts: 1}
+			store := &fakeProfileStore{ref: ref, deleteErr: errors.New("cleanup failed")}
+			s := newHermesTestServer(f)
+			s.profileStore = store
+
+			rec, body := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox"}, &multipartUpload{filename: "profile.zip", contents: hermesProfileZIP(t, "profile", "old")})
+
+			require.Equal(t, test.statusCode, rec.Code)
+			require.Equal(t, test.errorCode, body["error"])
+			require.Equal(t, []profilebundle.Ref{ref}, store.deleted)
+		})
+	}
+}
+
+func TestHermesCreationAcquiresAllowedGitWithDeadline(t *testing.T) {
+	f := &fakeTemporal{}
+	ref := profilebundle.Ref{ID: "seed-123", Parts: 1}
+	store := &fakeProfileStore{ref: ref}
+	s := newHermesTestServer(f)
+	s.cfg.HermesGitAllowedHosts = []string{"github.com", "profiles.example.com"}
+	s.profileStore = store
+	s.acquireGit = func(ctx context.Context, rawURL string, options profilebundle.GitOptions) (profilebundle.Bundle, error) {
+		require.Equal(t, "https://github.com/org/profile", rawURL)
+		require.Equal(t, s.cfg.HermesGitAllowedHosts, options.AllowedHosts)
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		require.LessOrEqual(t, time.Until(deadline), 30*time.Second)
+		return profilebundle.Bundle{Files: []profilebundle.File{
+			{Path: "distribution.yaml", Content: []byte("name: remote\n")},
+			{Path: "SOUL.md", Content: []byte("remote soul")},
+		}}, nil
+	}
+
+	rec, _ := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox", "gitUrl": "  https://github.com/org/profile  "}, nil)
+
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Len(t, store.staged, 1)
+	require.Equal(t, wf.HermesInput{Name: "calm-fox", Seed: &ref}, f.startedHermes[0])
+}
+
+func TestHermesCreationReturnsStableGitValidationError(t *testing.T) {
+	f := &fakeTemporal{}
+	s := newHermesTestServer(f)
+	s.profileStore = &fakeProfileStore{}
+	s.acquireGit = func(context.Context, string, profilebundle.GitOptions) (profilebundle.Bundle, error) {
+		return profilebundle.Bundle{}, errors.New("specific clone detail")
+	}
+
+	rec, body := doMultipart(t, s.Handler(), map[string]string{"name": "calm-fox", "gitUrl": "https://github.com/org/profile"}, nil)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "invalid-git", body["error"])
+	require.Equal(t, "Git source rejected: specific clone detail", body["message"])
+	require.Empty(t, f.startedHermes)
 }
 
 func TestHermesNameProposalIsAdjectiveAnimal(t *testing.T) {
@@ -384,6 +635,10 @@ func TestServesDedicatedHermesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Header().Get("Content-Type"), "text/html")
 	require.Contains(t, rec.Body.String(), "Hermes agents")
 	require.Contains(t, rec.Body.String(), "SOUL.md")
+	require.Contains(t, rec.Body.String(), "Advanced source (optional)")
+	require.Contains(t, rec.Body.String(), "HTTPS Git URL")
+	require.Contains(t, rec.Body.String(), "new FormData")
+	require.Contains(t, rec.Body.String(), `"bootstrap"`)
 	require.Contains(t, rec.Body.String(), "Reveal API token")
 	require.Contains(t, rec.Body.String(), "X-Hermes-Agent")
 	require.Contains(t, rec.Body.String(), "Authorization")

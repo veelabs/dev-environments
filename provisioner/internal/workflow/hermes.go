@@ -11,10 +11,12 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/activities"
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 )
 
 const (
 	HermesPhaseStorage     = "storage"
+	HermesPhaseBootstrap   = "bootstrap"
 	HermesPhaseCredentials = "credentials"
 	HermesPhaseStarting    = "starting"
 	HermesPhaseWiring      = "wiring"
@@ -34,10 +36,11 @@ const (
 )
 
 type HermesInput struct {
-	Name        string        `json:"name"`
-	Soul        string        `json:"soul,omitempty"`
-	State       *HermesStatus `json:"state,omitempty"`
-	Initialized bool          `json:"initialized,omitempty"`
+	Name        string             `json:"name"`
+	Soul        string             `json:"soul,omitempty"`
+	Seed        *profilebundle.Ref `json:"seed,omitempty"`
+	State       *HermesStatus      `json:"state,omitempty"`
+	Initialized bool               `json:"initialized,omitempty"`
 }
 
 type HermesOperation struct {
@@ -135,6 +138,8 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 	}
 	cleanupOnExit := true
 	initialized := in.Initialized
+	bootstrapped := false
+	seedCleanupPending := in.Seed != nil && !initialized
 	defer func() {
 		if !cleanupOnExit {
 			return
@@ -145,11 +150,70 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			workflow.GetLogger(ctx).Error("Hermes runtime cleanup failed", "agentID", agentID, "error", err)
 		}
 	}()
+	cleanupSeed := func(deletePVC bool) error {
+		cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
+		defer cancel()
+		cleanupShortCtx, _ := activityContexts(cleanupCtx)
+		var cleanupErrors []error
+		if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesBootstrap, agentID).Get(cleanupCtx, nil); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete bootstrap Job: %w", err))
+		}
+		if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesSeed, *in.Seed).Get(cleanupCtx, nil); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete staged seed: %w", err))
+		}
+		if deletePVC || len(cleanupErrors) != 0 {
+			if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesSeedPVC, activities.DeleteHermesSeedPVCInput{
+				AgentID: agentID, SeedID: in.Seed.ID,
+			}).Get(cleanupCtx, nil); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("delete uninitialized seeded persistent volume: %w", err))
+			}
+		}
+		err := errors.Join(cleanupErrors...)
+		if err == nil {
+			seedCleanupPending = false
+		}
+		return err
+	}
+	defer func() {
+		if !seedCleanupPending {
+			return
+		}
+		if err := cleanupSeed(true); err != nil {
+			workflow.GetLogger(ctx).Error("Hermes seed cleanup failed", "agentID", agentID, "error", err)
+		}
+	}()
 	initialize := func() error {
-		shortCtx, _ := activityContexts(ctx)
+		shortCtx, waitCtx := activityContexts(ctx)
 		status.Phase = HermesPhaseStorage
-		if err := workflow.ExecuteActivity(shortCtx, a.CreateHermesPVC, agentID).Get(ctx, nil); err != nil {
+		seedID := ""
+		if in.Seed != nil {
+			seedID = in.Seed.ID
+		}
+		var pvc activities.CreateHermesPVCOutput
+		if err := workflow.ExecuteActivity(shortCtx, a.CreateHermesPVC, activities.CreateHermesPVCInput{
+			AgentID: agentID, SeedID: seedID,
+		}).Get(ctx, &pvc); err != nil {
+			if seedCleanupPending {
+				status.Phase = HermesPhaseBootstrap
+				return fail("create persistent volume", errors.Join(err, cleanupSeed(true)))
+			}
 			return fail("create persistent volume", err)
+		}
+		if in.Seed != nil && !bootstrapped {
+			status.Phase = HermesPhaseBootstrap
+			var bootstrapErr error
+			if !pvc.Seedable {
+				bootstrapErr = errors.New("advanced seed requires a new persistent volume")
+			} else {
+				bootstrapErr = workflow.ExecuteActivity(waitCtx, a.BootstrapHermesPVC, activities.BootstrapHermesPVCInput{
+					AgentID: agentID, Seed: *in.Seed,
+				}).Get(ctx, nil)
+			}
+
+			if err := errors.Join(bootstrapErr, cleanupSeed(bootstrapErr != nil)); err != nil {
+				return fail("bootstrap persistent volume", err)
+			}
+			bootstrapped = true
 		}
 		status.Phase = HermesPhaseCredentials
 		if err := workflow.ExecuteActivity(shortCtx, a.CreateHermesCredentials, activities.CreateHermesCredentialsInput{
@@ -215,15 +279,25 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			hasPendingOperation = false
 		} else {
 			cancelled := false
+			retrySeedCleanup := false
 			selector := workflow.NewSelector(ctx)
 			selector.AddReceive(operations, func(channel workflow.ReceiveChannel, _ bool) {
 				channel.Receive(ctx, &operation)
 			})
 			selector.AddReceive(ctx.Done(), func(workflow.ReceiveChannel, bool) { cancelled = true })
+			if seedCleanupPending {
+				selector.AddFuture(workflow.NewTimer(ctx, time.Minute), func(workflow.Future) { retrySeedCleanup = true })
+			}
 			selector.Select(ctx)
 			if cancelled {
 				status.Phase = HermesPhaseStopping
 				return ctx.Err()
+			}
+			if retrySeedCleanup {
+				if err := cleanupSeed(true); err != nil {
+					workflow.GetLogger(ctx).Error("Hermes seed cleanup retry failed", "agentID", agentID, "error", err)
+				}
+				continue
 			}
 		}
 
@@ -241,6 +315,9 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			}
 		case HermesOperationStart:
 			if status.Phase != HermesPhaseRunning {
+				if status.Phase == HermesPhaseError && strings.HasPrefix(status.LastError, HermesPhaseBootstrap+":") {
+					break
+				}
 				wasError := status.Phase == HermesPhaseError
 				if !initialized {
 					if err := initialize(); err != nil {

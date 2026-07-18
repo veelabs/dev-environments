@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 )
 
 // Config holds landing-server settings, sourced from the Deployment env.
@@ -16,12 +19,13 @@ type Config struct {
 	ListenAddr string
 	// TemporalHostPort / TemporalNamespace / TaskQueue mirror the worker's
 	// connection settings so both talk to the same queue.
-	TemporalHostPort  string
-	TemporalNamespace string
-	TaskQueue         string
-	HermesNamespace   string
-	HermesAPISecret   string
-	HermesAPIBaseURL  string
+	TemporalHostPort      string
+	TemporalNamespace     string
+	TaskQueue             string
+	HermesNamespace       string
+	HermesAPISecret       string
+	HermesAPIBaseURL      string
+	HermesGitAllowedHosts []string
 	// ClaimTTL is the lifetime granted to devboxes claimed from the page.
 	ClaimTTL time.Duration
 	// MaxConcurrent caps running ProvisionDevEnvironment workflows before the
@@ -50,6 +54,17 @@ func LoadConfig() (Config, error) {
 	}
 	if c.Kind != "devbox" && c.Kind != "hermes" {
 		return c, fmt.Errorf("LANDING_KIND must be devbox or hermes, got %q", c.Kind)
+	}
+	if c.Kind == "hermes" {
+		hosts, ok := os.LookupEnv("HERMES_GIT_ALLOWED_HOSTS")
+		if !ok {
+			hosts = "github.com"
+		}
+		var err error
+		c.HermesGitAllowedHosts, err = profilebundle.NormalizeAllowedHosts(strings.Split(hosts, ","))
+		if err != nil {
+			return c, fmt.Errorf("HERMES_GIT_ALLOWED_HOSTS: %w", err)
+		}
 	}
 	ttl, err := time.ParseDuration(get("CLAIM_TTL", "1h"))
 	if err != nil || ttl <= 0 {
