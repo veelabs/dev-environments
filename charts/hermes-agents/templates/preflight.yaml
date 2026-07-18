@@ -46,37 +46,6 @@ subjects:
     name: hermes-preflight
     namespace: {{ .Release.Namespace }}
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: hermes-preflight
-  annotations:
-    argocd.argoproj.io/hook: PreSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-    argocd.argoproj.io/hook-weight: "-5"
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: [{{ .Values.hermes.apiSecret | quote }}]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: hermes-preflight
-  annotations:
-    argocd.argoproj.io/hook: PreSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-    argocd.argoproj.io/hook-weight: "-5"
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: hermes-preflight
-subjects:
-  - kind: ServiceAccount
-    name: hermes-preflight
-    namespace: {{ .Release.Namespace }}
----
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -96,18 +65,38 @@ spec:
       serviceAccountName: hermes-preflight
       restartPolicy: Never
       containers:
-        - name: kubernetes-check
+        - name: sandbox-api-check
           image: {{ .Values.preflight.kubectlImage }}
-          command: ["sh", "-c"]
-          args:
-            - >-
-              kubectl get --raw /apis/agents.x-k8s.io/v1beta1 >/dev/null &&
-              kubectl get storageclass {{ .Values.hermes.storageClass | quote }} &&
-              kubectl get ingressclass traefik &&
-              test -n "$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.hermes.apiSecret | quote }} -o jsonpath='{.data.key}')"
+          command: ["kubectl"]
+          args: ["get", "--raw", "/apis/agents.x-k8s.io/v1beta1"]
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}
+        - name: storage-class-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command: ["kubectl"]
+          args: ["get", "storageclass", {{ .Values.hermes.storageClass | quote }}]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        - name: ingress-class-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command: ["kubectl"]
+          args: ["get", "ingressclass", "traefik"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        - name: api-secret-check
+          image: {{ .Values.preflight.busyboxImage }}
+          command: ["sh", "-c"]
+          args: ["test -s /secret/key"]
+          volumeMounts:
+            - name: api-secret
+              mountPath: /secret
+              readOnly: true
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
         - name: temporal-check
           image: {{ .Values.preflight.busyboxImage }}
           command: ["sh", "-c"]
@@ -118,4 +107,11 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {memory: 32Mi}
+      volumes:
+        - name: api-secret
+          secret:
+            secretName: {{ .Values.hermes.apiSecret | quote }}
+            items:
+              - key: key
+                path: key
 {{- end }}

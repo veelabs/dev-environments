@@ -9,11 +9,20 @@ helm lint "$chart" --set-string baseDomain=example.test
 helm template hermes-agents "$chart" --namespace hermes-agents \
   --set-string baseDomain=example.test >"$rendered"
 
-grep -Fq 'value: hermes' "$rendered"
-grep -Fq 'app: hermes-agent' "$rendered"
-grep -Fq 'port: 9119' "$rendered"
-grep -Fq 'port: 8642' "$rendered"
-grep -Fq 'docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a' "$rendered"
-grep -Fq '/apis/agents.x-k8s.io/v1beta1' "$rendered"
-grep -Fq 'resources: ["pods"]' "$rendered"
-grep -Fq "jsonpath='{.data.key}'" "$rendered"
+assert_rendered() {
+  grep -Fq "$1" "$rendered" || {
+    echo "missing rendered contract: $1" >&2
+    return 1
+  }
+}
+
+assert_rendered 'value: hermes'
+assert_rendered 'app: hermes-agent'
+assert_rendered 'port: 9119'
+assert_rendered 'port: 8642'
+assert_rendered 'docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a'
+assert_rendered '/apis/agents.x-k8s.io/v1beta1'
+assert_rendered 'resources: ["pods"]'
+assert_rendered 'command: ["kubectl"]'
+assert_rendered 'test -s /secret/key'
+assert_rendered 'secretName: "hermes-api"'
