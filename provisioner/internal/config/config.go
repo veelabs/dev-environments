@@ -56,6 +56,9 @@ func Load() (Config, error) {
 	if c.BaseDomain == "" {
 		return c, fmt.Errorf("BASE_DOMAIN must not be empty")
 	}
+	if c.WorkerKind != "dev-environments" && c.WorkerKind != "hermes" {
+		return c, fmt.Errorf("WORKER_KIND must be dev-environments or hermes, got %q", c.WorkerKind)
+	}
 	if c.WorkerKind == "hermes" && (!strings.Contains(c.HermesImage, ":") || !strings.Contains(c.HermesImage, "@sha256:") || strings.Contains(c.HermesImage, ":latest")) {
 		return c, fmt.Errorf("HERMES_IMAGE must use a stable tag and sha256 digest, got %q", c.HermesImage)
 	}

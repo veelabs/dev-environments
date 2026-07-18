@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/activities"
@@ -44,9 +43,7 @@ func TestHermesAgentReportsFailedPhaseAndCompensatesRuntime(t *testing.T) {
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-brave-otter").
 		Return(hermesWorkflowTestImage, nil).Once()
 	e.OnActivity("AwaitHermesReady", mock.Anything, "agent-brave-otter").
-		Return(activities.AwaitHermesReadyOutput{}, temporal.NewNonRetryableApplicationError(
-			"pod unschedulable: insufficient memory", "ReadyTimeout", errors.New("timeout"),
-		)).Once()
+		Return(activities.AwaitHermesReadyOutput{}, errors.New("pod unschedulable: insufficient memory")).Once()
 	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-brave-otter").Return(nil).Once()
 	e.OnActivity("DeleteHermesService", mock.Anything, "agent-brave-otter").Return(nil).Once()
 	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-brave-otter").Return(nil).Once()

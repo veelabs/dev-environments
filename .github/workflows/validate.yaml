@@ -34,7 +34,6 @@ jobs:
   hermes-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: Verify supervised authenticated runtime
         run: |
           set -euo pipefail
@@ -54,10 +53,30 @@ jobs:
             -e API_SERVER_KEY=smoke-test-api-key-32-bytes-long \
             "$HERMES_IMAGE" gateway run
           trap 'docker logs hermes-smoke; docker rm -f hermes-smoke; docker volume rm hermes-smoke-data' EXIT
+          ready=false
           for _ in $(seq 1 120); do
-            curl -fsS http://127.0.0.1:9119/api/status >status.json && break
+            if curl -fsS http://127.0.0.1:9119/api/status >status.json && \
+               curl -fsS http://127.0.0.1:8642/health >api-health.json; then
+              ready=true
+              break
+            fi
             sleep 1
           done
+          test "$ready" = true
           jq -e '.auth_required == true and (.auth_providers | index("basic"))' status.json
-          curl -fsS http://127.0.0.1:8642/health | jq -e '.status == "ok" and .platform == "hermes-agent"'
-          docker exec hermes-smoke sh -c 'tr "\000" " " </proc/1/cmdline' | grep -F '/init'
+          jq -e '.status == "ok" and .platform == "hermes-agent"' api-health.json
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/api/auth/me)" = 401
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -c cookies.txt \
+            -H 'Content-Type: application/json' \
+            --data '{"provider":"basic","username":"hermes","password":"smoke-test-password"}' \
+            http://127.0.0.1:9119/auth/password-login)" = 200
+          curl -fsS -b cookies.txt http://127.0.0.1:9119/api/auth/me | jq -e '.provider == "basic"'
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8642/health/detailed)" = 401
+          curl -fsS -H 'Authorization: Bearer smoke-test-api-key-32-bytes-long' \
+            http://127.0.0.1:8642/health/detailed | jq -e '.status == "ok"'
+          docker exec hermes-smoke sh -ceu '
+            for service in gateway-default dashboard; do
+              state=$(/command/s6-svstat "/run/service/$service")
+              case "$state" in "up "*) ;; *) exit 1 ;; esac
+            done
+          '

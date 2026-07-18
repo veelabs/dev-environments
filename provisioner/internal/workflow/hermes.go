@@ -72,6 +72,7 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			InitialInterval:    time.Second,
 			BackoffCoefficient: 2,
 			MaximumInterval:    time.Minute,
+			MaximumAttempts:    5,
 		},
 	})
 	waitCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
@@ -81,6 +82,7 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			InitialInterval:    2 * time.Second,
 			BackoffCoefficient: 2,
 			MaximumInterval:    time.Minute,
+			MaximumAttempts:    1,
 		},
 	})
 
