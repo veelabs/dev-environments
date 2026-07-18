@@ -5,9 +5,11 @@ chart="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
 
-helm lint "$chart" --set-string baseDomain=example.test
+helm lint "$chart" --set-string baseDomain=example.test \
+  --set-string router.hostname=homelab-server.example.ts.net
 helm template hermes-agents "$chart" --namespace hermes-agents \
-  --set-string baseDomain=example.test >"$rendered"
+	--set-string baseDomain=example.test \
+	--set-string router.hostname=homelab-server.example.ts.net >"$rendered"
 
 assert_rendered() {
   grep -Fq "$1" "$rendered" || {
@@ -32,7 +34,15 @@ assert_rendered 'name: hermes-landing'
 assert_rendered 'value: "hermes"'
 assert_rendered 'host: "agents.example.test"'
 assert_rendered 'path: /healthz'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.4.0'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.5.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.5.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.6.0'
 assert_rendered 'verbs: ["get"]'
 assert_rendered 'verbs: ["get", "list", "watch", "create", "delete", "update"]'
+assert_rendered 'name: hermes-api-router'
+assert_rendered 'app: hermes-api-router'
+assert_rendered 'nodePort: 30864'
+assert_rendered 'externalTrafficPolicy: Local'
+assert_rendered 'node-role.kubernetes.io/control-plane: "true"'
+assert_rendered 'cidr: 100.64.0.0/10'
+assert_rendered 'value: ".hermes-agents.svc.cluster.local:8642"'
+assert_rendered 'value: "http://homelab-server.example.ts.net:30864"'

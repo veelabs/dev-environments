@@ -6,7 +6,7 @@ temporal:
   taskQueue: hermes-agents
 
 worker:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.5.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.6.0
   resources:
     requests:
       cpu: 50m
@@ -15,7 +15,7 @@ worker:
       memory: 128Mi
 
 landing:
-  image: ghcr.io/veelabs/dev-environments-landing:0.4.0
+  image: ghcr.io/veelabs/dev-environments-landing:0.5.0
   subdomain: agents
   resources:
     requests:
@@ -23,6 +23,19 @@ landing:
       memory: 32Mi
     limits:
       memory: 64Mi
+
+router:
+  hostname: ""
+  nodePort: 30864
+  tailnetCIDR: 100.64.0.0/10
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 32Mi
 
 ingressClassName: traefik
 

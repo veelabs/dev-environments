@@ -177,6 +177,7 @@ func (a *Activities) CreateHermesSandbox(ctx context.Context, agentID string) (s
 		map[string]any{"name": "API_SERVER_ENABLED", "value": "true"},
 		map[string]any{"name": "API_SERVER_HOST", "value": "0.0.0.0"},
 		map[string]any{"name": "API_SERVER_PORT", "value": "8642"},
+		map[string]any{"name": "API_SERVER_CORS_ORIGINS", "value": ""},
 		map[string]any{"name": "API_SERVER_KEY", "valueFrom": map[string]any{
 			"secretKeyRef": map[string]any{"name": a.cfg.HermesAPISecret, "key": "key"},
 		}},

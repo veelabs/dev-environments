@@ -20,6 +20,8 @@ type Config struct {
 	TemporalNamespace string
 	TaskQueue         string
 	HermesNamespace   string
+	HermesAPISecret   string
+	HermesAPIBaseURL  string
 	// ClaimTTL is the lifetime granted to devboxes claimed from the page.
 	ClaimTTL time.Duration
 	// MaxConcurrent caps running ProvisionDevEnvironment workflows before the
@@ -43,6 +45,8 @@ func LoadConfig() (Config, error) {
 		TemporalNamespace: get("TEMPORAL_NAMESPACE", "default"),
 		TaskQueue:         get("TASK_QUEUE", "dev-environments"),
 		HermesNamespace:   get("SANDBOX_NAMESPACE", "hermes-agents"),
+		HermesAPISecret:   get("HERMES_API_SECRET", "hermes-api"),
+		HermesAPIBaseURL:  get("HERMES_API_BASE_URL", ""),
 	}
 	if c.Kind != "devbox" && c.Kind != "hermes" {
 		return c, fmt.Errorf("LANDING_KIND must be devbox or hermes, got %q", c.Kind)

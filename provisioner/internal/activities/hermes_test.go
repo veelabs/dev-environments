@@ -100,6 +100,7 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	sandboxJSON, err := json.Marshal(sandbox.Object)
 	require.NoError(t, err)
 	require.NotContains(t, string(sandboxJSON), "hostPath")
+	require.Contains(t, string(sandboxJSON), `"name":"API_SERVER_CORS_ORIGINS","value":""`)
 
 	sandbox.Object["status"] = map[string]any{
 		"selector":   "agents.x-k8s.io/sandbox-name-hash=abc123",
