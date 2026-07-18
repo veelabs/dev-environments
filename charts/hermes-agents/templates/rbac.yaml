@@ -12,8 +12,11 @@ rules:
     resources: ["sandboxes"]
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims", "secrets", "services"]
+    resources: ["persistentvolumeclaims", "services"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
@@ -32,4 +35,31 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: hermes-worker
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-landing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-landing
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-landing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hermes-landing
+subjects:
+  - kind: ServiceAccount
+    name: hermes-landing
     namespace: {{ .Release.Namespace }}

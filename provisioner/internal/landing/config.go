@@ -1,6 +1,4 @@
-// Package landing serves the public "claim a devbox" page: an embedded
-// static frontend plus a small JSON API that starts ProvisionDevEnvironment
-// workflows and proxies their "status" query.
+// Package landing serves the devbox and Hermes operator frontends and APIs.
 package landing
 
 import (
@@ -12,6 +10,8 @@ import (
 
 // Config holds landing-server settings, sourced from the Deployment env.
 type Config struct {
+	// Kind selects the devbox or Hermes landing experience.
+	Kind string
 	// ListenAddr is the HTTP bind address (default ":8080").
 	ListenAddr string
 	// TemporalHostPort / TemporalNamespace / TaskQueue mirror the worker's
@@ -19,6 +19,7 @@ type Config struct {
 	TemporalHostPort  string
 	TemporalNamespace string
 	TaskQueue         string
+	HermesNamespace   string
 	// ClaimTTL is the lifetime granted to devboxes claimed from the page.
 	ClaimTTL time.Duration
 	// MaxConcurrent caps running ProvisionDevEnvironment workflows before the
@@ -36,10 +37,15 @@ func get(key, def string) string {
 // LoadConfig reads configuration from the environment.
 func LoadConfig() (Config, error) {
 	c := Config{
+		Kind:              get("LANDING_KIND", "devbox"),
 		ListenAddr:        get("LISTEN_ADDR", ":8080"),
 		TemporalHostPort:  get("TEMPORAL_HOSTPORT", "temporal-frontend.temporal:7233"),
 		TemporalNamespace: get("TEMPORAL_NAMESPACE", "default"),
 		TaskQueue:         get("TASK_QUEUE", "dev-environments"),
+		HermesNamespace:   get("SANDBOX_NAMESPACE", "hermes-agents"),
+	}
+	if c.Kind != "devbox" && c.Kind != "hermes" {
+		return c, fmt.Errorf("LANDING_KIND must be devbox or hermes, got %q", c.Kind)
 	}
 	ttl, err := time.ParseDuration(get("CLAIM_TTL", "1h"))
 	if err != nil || ttl <= 0 {

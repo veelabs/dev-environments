@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/testsuite"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -56,6 +57,15 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	require.Equal(t, "# Calm Fox\n", secret.StringData["SOUL.md"])
 	require.Len(t, secret.StringData["password"], 32)
 	require.Len(t, secret.StringData["session-secret"], 43)
+	originalPassword := secret.StringData["password"]
+	originalSessionSecret := secret.StringData["session-secret"]
+	require.NoError(t, a.RotateHermesCredentials(ctx, "agent-calm-fox"))
+	secret, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "hermes", secret.StringData["username"])
+	require.Equal(t, "# Calm Fox\n", secret.StringData["SOUL.md"])
+	require.NotEqual(t, originalPassword, secret.StringData["password"])
+	require.NotEqual(t, originalSessionSecret, secret.StringData["session-secret"])
 	require.NoError(t, a.CreateHermesCredentials(ctx, CreateHermesCredentialsInput{AgentID: "agent-bold-yak"}))
 	otherSecret, err := kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-bold-yak", metav1.GetOptions{})
 	require.NoError(t, err)
@@ -131,14 +141,27 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 		}, nil
 	}
 	require.NoError(t, a.VerifyHermesHealth(ctx, "agent-calm-fox"))
+	resources, err := a.InspectHermesResources(ctx, "agent-calm-fox")
+	require.NoError(t, err)
+	require.True(t, resources.RuntimePresent)
+	require.True(t, resources.PVCPresent)
 
 	require.NoError(t, a.DeleteHermesIngress(ctx, "agent-calm-fox"))
 	require.NoError(t, a.DeleteHermesService(ctx, "agent-calm-fox"))
 	require.NoError(t, a.DeleteHermesSandbox(ctx, "agent-calm-fox"))
+	_, err = activityEnv.ExecuteActivity(a.AwaitHermesRuntimeAbsent, "agent-calm-fox")
+	require.NoError(t, err)
+	resources, err = a.InspectHermesResources(ctx, "agent-calm-fox")
+	require.NoError(t, err)
+	require.False(t, resources.RuntimePresent)
+	require.True(t, resources.PVCPresent)
 	_, err = kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
 	require.NoError(t, err)
 	_, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
 	require.NoError(t, err)
+	require.NoError(t, a.DeleteHermesCredentials(ctx, "agent-calm-fox"))
+	_, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
 }
 
 func TestAwaitHermesReadyReportsTerminalSandboxFailure(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
@@ -29,7 +30,28 @@ type fakeTemporal struct {
 	describeStatus enums.WorkflowExecutionStatus
 	describeErr    error
 	queryStatus    wf.Status
+	hermesStatuses map[string]wf.HermesStatus
+	queriedIDs     []string
 	queryErr       error
+	startedHermes  []wf.HermesInput
+	listResponses  []*workflowservice.ListWorkflowExecutionsResponse
+	listRequests   []*workflowservice.ListWorkflowExecutionsRequest
+	signals        []fakeSignal
+}
+
+type fakeSignal struct {
+	workflowID string
+	name       string
+	value      any
+}
+
+type fakeCredentialStore struct {
+	credentials DashboardCredentials
+	err         error
+}
+
+func (f fakeCredentialStore) Get(context.Context, string) (DashboardCredentials, error) {
+	return f.credentials, f.err
 }
 
 func (f *fakeTemporal) ExecuteWorkflow(_ context.Context, opts client.StartWorkflowOptions, _ interface{}, args ...interface{}) (client.WorkflowRun, error) {
@@ -37,6 +59,9 @@ func (f *fakeTemporal) ExecuteWorkflow(_ context.Context, opts client.StartWorkf
 	if len(args) == 1 {
 		if in, ok := args[0].(wf.ProvisionInput); ok {
 			f.startedInputs = append(f.startedInputs, in)
+		}
+		if in, ok := args[0].(wf.HermesInput); ok {
+			f.startedHermes = append(f.startedHermes, in)
 		}
 	}
 	if len(f.startErrs) > 0 {
@@ -47,20 +72,42 @@ func (f *fakeTemporal) ExecuteWorkflow(_ context.Context, opts client.StartWorkf
 	return nil, nil
 }
 
-type fakeValue struct{ st wf.Status }
+type fakeValue struct{ value any }
 
 func (v fakeValue) Get(ptr interface{}) error {
-	*(ptr.(*wf.Status)) = v.st
-	return nil
+	payload, err := json.Marshal(v.value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(payload, ptr)
 }
 
-func (f *fakeTemporal) QueryWorkflow(context.Context, string, string, string, ...interface{}) (interface {
+func (f *fakeTemporal) QueryWorkflow(_ context.Context, workflowID, _ string, _ string, _ ...interface{}) (interface {
 	Get(valuePtr interface{}) error
 }, error) {
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}
+	f.queriedIDs = append(f.queriedIDs, workflowID)
+	if status, ok := f.hermesStatuses[workflowID]; ok {
+		return fakeValue{status}, nil
+	}
 	return fakeValue{f.queryStatus}, nil
+}
+
+func (f *fakeTemporal) ListWorkflow(_ context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {
+	f.listRequests = append(f.listRequests, request)
+	if len(f.listResponses) == 0 {
+		return &workflowservice.ListWorkflowExecutionsResponse{}, nil
+	}
+	response := f.listResponses[0]
+	f.listResponses = f.listResponses[1:]
+	return response, nil
+}
+
+func (f *fakeTemporal) SignalWorkflow(_ context.Context, workflowID, _ string, signalName string, value interface{}) error {
+	f.signals = append(f.signals, fakeSignal{workflowID: workflowID, name: signalName, value: value})
+	return nil
 }
 
 func (f *fakeTemporal) CountWorkflow(context.Context, *workflowservice.CountWorkflowExecutionsRequest) (*workflowservice.CountWorkflowExecutionsResponse, error) {
@@ -94,6 +141,116 @@ func doJSON(t *testing.T, h http.Handler, method, path string) (*httptest.Respon
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body), "body: %s", rec.Body.String())
 	return rec, body
+}
+
+func doJSONBody(t *testing.T, h http.Handler, method, path, body string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+	return rec, response
+}
+
+func newHermesTestServer(f *fakeTemporal) *Server {
+	return &Server{
+		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default"},
+		tc:  f,
+	}
+}
+
+func TestHermesCreationUsesStableValidatedIdentity(t *testing.T) {
+	f := &fakeTemporal{}
+	h := newHermesTestServer(f).Handler()
+
+	rec, body := doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"calm-fox","soul":"# Calm Fox\n"}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Equal(t, "agent-calm-fox", body["id"])
+	require.Equal(t, "agent-calm-fox", f.startedOpts[0].ID)
+	require.Equal(t, "hermes-agents", f.startedOpts[0].TaskQueue)
+	require.Equal(t, wf.HermesInput{Name: "calm-fox", Soul: "# Calm Fox\n"}, f.startedHermes[0])
+
+	rec, body = doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"Not DNS safe"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "invalid-name", body["error"])
+	require.Len(t, f.startedOpts, 1)
+
+	rec, body = doJSONBody(t, h, http.MethodPost, "/api/agents", `{"name":"bold-yak","initialized":true}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "invalid-request", body["error"])
+	require.Len(t, f.startedOpts, 1)
+}
+
+func TestHermesNameProposalIsAdjectiveAnimal(t *testing.T) {
+	rec, body := doJSON(t, newHermesTestServer(&fakeTemporal{}).Handler(), http.MethodGet, "/api/agents/name")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Regexp(t, `^[a-z]+-[a-z]+$`, body["name"])
+}
+
+func TestHermesListPaginatesVisibilityAndQueriesCurrentRuns(t *testing.T) {
+	f := &fakeTemporal{
+		listResponses: []*workflowservice.ListWorkflowExecutionsResponse{
+			{Executions: []*workflowpb.WorkflowExecutionInfo{workflowInfo("agent-calm-fox")}, NextPageToken: []byte("next")},
+			{Executions: []*workflowpb.WorkflowExecutionInfo{workflowInfo("agent-bold-yak")}},
+		},
+		hermesStatuses: map[string]wf.HermesStatus{
+			"agent-calm-fox": {Phase: wf.HermesPhaseRunning, AgentID: "agent-calm-fox", DashboardURL: "https://agent-calm-fox.renala.dev", Image: "hermes:v1"},
+			"agent-bold-yak": {Phase: wf.HermesPhaseStopped, AgentID: "agent-bold-yak"},
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/agents", nil)
+	rec := httptest.NewRecorder()
+	newHermesTestServer(f).Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var statuses []wf.HermesStatus
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &statuses))
+	require.Len(t, statuses, 2)
+	require.Equal(t, []string{"agent-calm-fox", "agent-bold-yak"}, f.queriedIDs)
+	require.Len(t, f.listRequests, 2)
+	require.Equal(t, "WorkflowType = 'ProvisionHermesAgent' AND ExecutionStatus = 'Running'", f.listRequests[0].Query)
+	require.Equal(t, []byte("next"), f.listRequests[1].NextPageToken)
+}
+
+func TestHermesLifecycleRequestsSignalTheEntity(t *testing.T) {
+	f := &fakeTemporal{}
+	h := newHermesTestServer(f).Handler()
+
+	for _, operation := range []string{"stop", "start", "credentials/rotate"} {
+		rec, _ := doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/"+operation, `{}`)
+		require.Equal(t, http.StatusAccepted, rec.Code)
+	}
+	rec, body := doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/forget", `{"confirmation":"wrong"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "confirmation", body["error"])
+	rec, _ = doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/forget", `{"confirmation":"agent-calm-fox"}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	require.Equal(t, []fakeSignal{
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationStop}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationStart}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationRotateCredentials}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationForget, Confirmation: "agent-calm-fox"}},
+	}, f.signals)
+}
+
+func TestHermesCredentialsAreRevealedWithoutCaching(t *testing.T) {
+	s := newHermesTestServer(&fakeTemporal{})
+	s.credentials = fakeCredentialStore{credentials: DashboardCredentials{
+		Username: "hermes", Password: "generated-password",
+	}}
+	rec, body := doJSON(t, s.Handler(), http.MethodGet, "/api/agents/agent-calm-fox/credentials")
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	require.Equal(t, "hermes", body["username"])
+	require.Equal(t, "generated-password", body["password"])
+}
+
+func workflowInfo(id string) *workflowpb.WorkflowExecutionInfo {
+	return &workflowpb.WorkflowExecutionInfo{Execution: &commonpb.WorkflowExecution{WorkflowId: id}}
 }
 
 func TestClaimStartsWorkflow(t *testing.T) {
@@ -200,6 +357,18 @@ func TestServesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "Claim your devbox")
 	// Port-forwarding explainer on the ready panel.
 	require.Contains(t, rec.Body.String(), "Every port is already public")
+}
+
+func TestServesDedicatedHermesLandingPage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	newHermesTestServer(&fakeTemporal{}).Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+	require.Contains(t, rec.Body.String(), "Hermes agents")
+	require.Contains(t, rec.Body.String(), "SOUL.md")
+	require.NotContains(t, rec.Body.String(), "provider key")
 }
 
 func TestRandomNamesAreValidEnvNames(t *testing.T) {
