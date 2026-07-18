@@ -1,0 +1,82 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  HERMES_IMAGE: docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: provisioner/go.mod
+      - run: go test ./...
+        working-directory: provisioner
+      - run: go vet ./...
+        working-directory: provisioner
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: charts/hermes-agents/tests/render.sh
+
+  hermes-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify supervised authenticated runtime
+        run: |
+          set -euo pipefail
+          docker pull "$HERMES_IMAGE"
+          test "$(docker inspect --format '{{json .Config.Entrypoint}}' "$HERMES_IMAGE")" = '["/init","/opt/hermes/docker/main-wrapper.sh"]'
+          docker volume create hermes-smoke-data
+          docker run -d --name hermes-smoke \
+            -p 9119:9119 -p 8642:8642 \
+            -v hermes-smoke-data:/opt/data \
+            -e HERMES_DASHBOARD=1 \
+            -e HERMES_DASHBOARD_HOST=0.0.0.0 \
+            -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=hermes \
+            -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=smoke-test-password \
+            -e HERMES_DASHBOARD_BASIC_AUTH_SECRET=smoke-test-session-secret-32-bytes \
+            -e API_SERVER_ENABLED=true \
+            -e API_SERVER_HOST=0.0.0.0 \
+            -e API_SERVER_KEY=smoke-test-api-key-32-bytes-long \
+            "$HERMES_IMAGE" gateway run
+          trap 'docker logs hermes-smoke; docker rm -f hermes-smoke; docker volume rm hermes-smoke-data' EXIT
+          ready=false
+          for _ in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:9119/api/status >status.json && \
+               curl -fsS http://127.0.0.1:8642/health >api-health.json; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          jq -e '.auth_required == true and (.auth_providers | index("basic"))' status.json
+          jq -e '.status == "ok" and .platform == "hermes-agent"' api-health.json
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:9119/api/auth/me)" = 401
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -c cookies.txt \
+            -H 'Content-Type: application/json' \
+            --data '{"provider":"basic","username":"hermes","password":"smoke-test-password"}' \
+            http://127.0.0.1:9119/auth/password-login)" = 200
+          curl -fsS -b cookies.txt http://127.0.0.1:9119/api/auth/me | jq -e '.provider == "basic"'
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8642/health/detailed)" = 401
+          curl -fsS -H 'Authorization: Bearer smoke-test-api-key-32-bytes-long' \
+            http://127.0.0.1:8642/health/detailed | jq -e '.status == "ok"'
+          docker exec hermes-smoke sh -ceu '
+            for service in gateway-default dashboard; do
+              state=$(/command/s6-svstat "/run/service/$service")
+              case "$state" in "up "*) ;; *) exit 1 ;; esac
+            done
+          '

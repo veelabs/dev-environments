@@ -15,7 +15,7 @@ permissions:
 env:
   # Bump these to cut a new image version; chart values pin the same tags.
   SANDBOX_TAG: "1.17.15-1.14.1" # <opencode-ai>-<@openchamber/web>
-  PROVISIONER_TAG: "0.3.2"
+  PROVISIONER_TAG: "0.4.0"
   LANDING_TAG: "0.3.3"
 
 jobs:

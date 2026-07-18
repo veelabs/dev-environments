@@ -75,11 +75,30 @@ temporal workflow cancel --workflow-id ...                  # early teardown
 
 Full operational guide: [`docs/runbook.md`](docs/runbook.md).
 
+## Persistent Hermes tracer
+
+The independent `charts/hermes-agents` release runs a dedicated Temporal
+worker for persistent Hermes agents. Start and inspect the first tracer from
+the Temporal CLI:
+
+```sh
+temporal workflow start --task-queue hermes-agents \
+  --type ProvisionHermesAgent --workflow-id agent-calm-fox \
+  --input '{"name":"calm-fox","soul":"# Calm Fox"}'
+temporal workflow query --workflow-id agent-calm-fox --type status
+temporal workflow cancel --workflow-id agent-calm-fox
+```
+
+Cancellation removes the Sandbox, Service, and Ingress. The `5Gi` PVC and
+generated dashboard credential Secret remain in `hermes-agents`; retrieve the
+password with `kubectl -n hermes-agents get secret agent-calm-fox -o jsonpath='{.data.password}' | base64 -d`.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `charts/dev-environments/` | Helm chart (the deployable) |
+| `charts/hermes-agents/` | Independent persistent Hermes tracer chart |
 | `provisioner/` | Go module: Temporal worker (workflows + k8s activities) and landing server |
 | `images/sandbox/` | OpenCode + OpenChamber sandbox image |
 | `images/provisioner/` | worker image |

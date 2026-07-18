@@ -1,0 +1,14 @@
+apiVersion: v2
+name: hermes-agents
+description: Persistent Hermes agents provisioned through Temporal and Agent Sandbox
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/veelabs/dev-environments
+annotations:
+  dev-environments.veelabs.dev/requires: |
+    1. Agent Sandbox v1beta1 Sandbox API
+    2. Temporal frontend
+    3. Traefik ingress class and wildcard edge route
+    4. local-path storage class
+    5. Existing namespace API credential Secret
