@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-worker
+  template:
+    metadata:
+      labels:
+        app: hermes-worker
+    spec:
+      serviceAccountName: hermes-worker
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          env:
+            - name: WORKER_KIND
+              value: hermes
+            - name: TEMPORAL_HOSTPORT
+              value: {{ .Values.temporal.hostPort | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | quote }}
+            - name: SANDBOX_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: BASE_DOMAIN
+              value: {{ required "baseDomain is required" .Values.baseDomain | quote }}
+            - name: TRAEFIK_URL
+              value: http://traefik.kube-system
+            - name: HERMES_IMAGE
+              value: {{ .Values.hermes.image | quote }}
+            - name: HERMES_STORAGE_CLASS
+              value: {{ .Values.hermes.storageClass | quote }}
+            - name: HERMES_API_SECRET
+              value: {{ .Values.hermes.apiSecret | quote }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

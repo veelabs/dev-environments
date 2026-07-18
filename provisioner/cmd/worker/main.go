@@ -47,12 +47,16 @@ func main() {
 	defer tc.Close()
 
 	w := worker.New(tc, cfg.TaskQueue, worker.Options{})
-	w.RegisterWorkflow(wf.ProvisionDevEnvironment)
-	w.RegisterWorkflow(wf.DeprovisionDevEnvironment)
+	if cfg.WorkerKind == "hermes" {
+		w.RegisterWorkflow(wf.ProvisionHermesAgent)
+	} else {
+		w.RegisterWorkflow(wf.ProvisionDevEnvironment)
+		w.RegisterWorkflow(wf.DeprovisionDevEnvironment)
+	}
 	w.RegisterActivity(activities.New(cfg, dyn, kube))
 
-	log.Printf("provisioner worker starting: queue=%s namespace=%s sandboxNS=%s template=%s",
-		cfg.TaskQueue, cfg.TemporalNamespace, cfg.SandboxNamespace, cfg.SandboxTemplate)
+	log.Printf("provisioner worker starting: kind=%s queue=%s namespace=%s sandboxNS=%s",
+		cfg.WorkerKind, cfg.TaskQueue, cfg.TemporalNamespace, cfg.SandboxNamespace)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker: %v", err)
 	}
