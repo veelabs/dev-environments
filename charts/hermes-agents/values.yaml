@@ -6,7 +6,7 @@ temporal:
   taskQueue: hermes-agents
 
 worker:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.7.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.8.0
   resources:
     requests:
       cpu: 50m
@@ -15,7 +15,7 @@ worker:
       memory: 128Mi
 
 landing:
-  image: ghcr.io/veelabs/dev-environments-landing:0.6.0
+  image: ghcr.io/veelabs/dev-environments-landing:0.7.0
   subdomain: agents
   resources:
     requests:
@@ -39,6 +39,11 @@ router:
       memory: 16Mi
     limits:
       memory: 32Mi
+
+backup:
+  repository: ""
+  secretName: hermes-backup
+  image: docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510
 
 ingressClassName: traefik
 

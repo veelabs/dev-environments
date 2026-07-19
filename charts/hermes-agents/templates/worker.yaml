@@ -37,6 +37,12 @@ spec:
               value: {{ .Values.hermes.storageClass | quote }}
             - name: HERMES_API_SECRET
               value: {{ .Values.hermes.apiSecret | quote }}
+            - name: HERMES_RESTIC_IMAGE
+              value: {{ .Values.backup.image | quote }}
+            - name: HERMES_BACKUP_SECRET
+              value: {{ .Values.backup.secretName | quote }}
+            - name: HERMES_BACKUP_REPOSITORY
+              value: {{ required "backup.repository is required" .Values.backup.repository | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           securityContext:
