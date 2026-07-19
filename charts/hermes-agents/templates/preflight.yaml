@@ -1,6 +1,10 @@
 {{- if .Values.preflight.enabled }}
 {{- $tHost := (split ":" .Values.temporal.hostPort)._0 }}
 {{- $tPort := (split ":" .Values.temporal.hostPort)._1 }}
+{{- $routerNodeSelector := list }}
+{{- range $key, $value := .Values.router.nodeSelector }}
+{{- $routerNodeSelector = append $routerNodeSelector (printf "%s=%s" $key $value) }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -105,10 +109,10 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}
-        - name: control-plane-check
+        - name: router-node-check
           image: {{ .Values.preflight.kubectlImage }}
           command: ["kubectl"]
-          args: ["wait", "nodes", "--selector=node-role.kubernetes.io/control-plane=true", "--for=condition=Ready", "--timeout=30s"]
+          args: ["wait", "nodes", {{ printf "--selector=%s" (join "," $routerNodeSelector) | quote }}, "--for=condition=Ready", "--timeout=30s"]
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}

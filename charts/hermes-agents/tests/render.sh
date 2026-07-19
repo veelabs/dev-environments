@@ -21,6 +21,7 @@ helm template hermes-agents "$chart" --namespace hermes-agents \
 	--set-string router.hostname=homelab-server.example.ts.net \
 	--set-string backup.repository=sftp:user@nas:/repo \
 	--set-string backup.maintenance.schedule='30 6 * * *' \
+	--set-string router.nodeSelector.workload=hermes \
 	--set-string 'hermes.gitAllowedHosts[0]=github.com' \
 	--set-string 'hermes.gitAllowedHosts[1]=gitlab.com' >"$rendered_custom"
 helm template hermes-agents "$chart" --namespace hermes-agents \
@@ -123,6 +124,7 @@ assert_rendered '/apis/monitoring.coreos.com/v1'
 assert_rendered 'args: ["get", "--raw", "/apis/monitoring.coreos.com/v1"]'
 assert_rendered 'args: ["get", "--raw", "/apis/traefik.io/v1alpha1"]'
 assert_rendered 'args: ["wait", "nodes", "--selector=node-role.kubernetes.io/control-plane=true", "--for=condition=Ready", "--timeout=30s"]'
+assert_rendered 'args: ["wait", "nodes", "--selector=node-role.kubernetes.io/control-plane=true,workload=hermes", "--for=condition=Ready", "--timeout=30s"]' "$rendered_custom"
 assert_not_rendered 'kind: PrometheusRule' "$rendered_no_monitoring"
 assert_not_rendered '/apis/monitoring.coreos.com/v1' "$rendered_no_monitoring"
 assert_images_pinned "$rendered"
