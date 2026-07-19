@@ -149,6 +149,8 @@ func TestListHermesSnapshotsFiltersAgentIdentityAndSortsNewestFirst(t *testing.T
 	require.Contains(t, container.Args[0], `--host "$AGENT_ID"`)
 	require.Contains(t, container.Args[0], `--tag "hermes-agent,agent:$AGENT_ID"`)
 	require.Contains(t, container.Args[0], "--path /backup/hermes.zip")
+	require.Contains(t, container.Args[0], ">/work/snapshots.json 2>/work/snapshots.err")
+	require.Contains(t, container.Args[0], "cat /work/snapshots.err >&2")
 	require.Equal(t, "hermes-backup", job.Spec.Template.Spec.Volumes[0].Secret.SecretName)
 }
 

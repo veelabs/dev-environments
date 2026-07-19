@@ -128,7 +128,13 @@ tail -n 1 /backup/restic-result.json >/dev/termination-log
 
 const hermesResticSnapshotsScript = `
 mkdir -p "$HOME/.ssh" "$RESTIC_CACHE_DIR"
-exec restic -o 'sftp.args=-i /secret/ssh-privatekey -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new' snapshots --json --host "$AGENT_ID" --tag "hermes-agent,agent:$AGENT_ID" --path /backup/hermes.zip
+if restic -o 'sftp.args=-i /secret/ssh-privatekey -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new' snapshots --json --host "$AGENT_ID" --tag "hermes-agent,agent:$AGENT_ID" --path /backup/hermes.zip >/work/snapshots.json 2>/work/snapshots.err; then
+    cat /work/snapshots.json
+else
+    status=$?
+    cat /work/snapshots.err >&2
+    exit "$status"
+fi
 `
 
 const hermesResticRestoreScript = `
