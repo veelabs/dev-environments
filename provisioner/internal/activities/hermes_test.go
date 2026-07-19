@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/testsuite"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -21,6 +22,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/config"
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 )
 
 const hermesTestImage = "docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a"
@@ -38,7 +40,9 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 		HermesAPISecret:    "hermes-api",
 	}, dyn, kube)
 
-	require.NoError(t, a.CreateHermesPVC(ctx, "agent-calm-fox"))
+	created, err := a.CreateHermesPVC(ctx, CreateHermesPVCInput{AgentID: "agent-calm-fox"})
+	require.NoError(t, err)
+	require.True(t, created.Seedable)
 	pvc, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, corev1.VolumeResourceRequirements{
@@ -163,6 +167,193 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	require.NoError(t, a.DeleteHermesCredentials(ctx, "agent-calm-fox"))
 	_, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, "agent-calm-fox", metav1.GetOptions{})
 	require.True(t, apierrors.IsNotFound(err))
+}
+
+func TestCreateHermesPVCReportsSeededRetriesAndUnrelatedClaims(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{SandboxNamespace: "hermes-agents", HermesStorageClass: "local-path"}, nil, kube)
+	in := CreateHermesPVCInput{AgentID: "agent-seeded-fox", SeedID: "seed-123"}
+
+	first, err := a.CreateHermesPVC(ctx, in)
+	require.NoError(t, err)
+	require.True(t, first.Seedable)
+	retry, err := a.CreateHermesPVC(ctx, in)
+	require.NoError(t, err)
+	require.True(t, retry.Seedable)
+
+	pvc, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, in.AgentID, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, in.SeedID, pvc.Annotations[hermesSeedIDAnnotation])
+	require.NoError(t, kube.CoreV1().PersistentVolumeClaims("hermes-agents").Delete(ctx, in.AgentID, metav1.DeleteOptions{}))
+	_, err = kube.CoreV1().PersistentVolumeClaims("hermes-agents").Create(ctx, &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: in.AgentID, Namespace: "hermes-agents"},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	unrelated, err := a.CreateHermesPVC(ctx, in)
+	require.NoError(t, err)
+	require.False(t, unrelated.Seedable)
+}
+
+func TestDeleteHermesSeedPVCOnlyDeletesMatchingMarker(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "agent-matching-fox", Namespace: "hermes-agents",
+			Annotations: map[string]string{hermesSeedIDAnnotation: "seed-123"},
+		}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: "agent-unrelated-fox", Namespace: "hermes-agents",
+			Annotations: map[string]string{hermesSeedIDAnnotation: "other-seed"},
+		}},
+	)
+	a := New(config.Config{SandboxNamespace: "hermes-agents"}, nil, kube)
+
+	require.NoError(t, a.DeleteHermesSeedPVC(ctx, DeleteHermesSeedPVCInput{
+		AgentID: "agent-matching-fox", SeedID: "seed-123",
+	}))
+	require.NoError(t, a.DeleteHermesSeedPVC(ctx, DeleteHermesSeedPVCInput{
+		AgentID: "agent-matching-fox", SeedID: "seed-123",
+	}))
+	_, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, "agent-matching-fox", metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+
+	require.NoError(t, a.DeleteHermesSeedPVC(ctx, DeleteHermesSeedPVCInput{
+		AgentID: "agent-unrelated-fox", SeedID: "seed-123",
+	}))
+	_, err = kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, "agent-unrelated-fox", metav1.GetOptions{})
+	require.NoError(t, err)
+}
+
+func TestBootstrapHermesPVCJobContractAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace: "hermes-agents",
+		HermesImage:      hermesTestImage,
+	}, nil, kube)
+	ref := profilebundle.Ref{ID: strings.Repeat("a", 32), Parts: 3, Digest: strings.Repeat("b", 64)}
+	completeHermesBootstrapJob(t, ctx, kube, "agent-seeded-fox", batchv1.JobComplete, "", "")
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.BootstrapHermesPVC, BootstrapHermesPVCInput{
+		AgentID: "agent-seeded-fox",
+		Seed:    ref,
+	})
+	require.NoError(t, err)
+	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, "agent-seeded-fox", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ref.ID, job.Annotations[hermesSeedIDAnnotation])
+	require.Equal(t, int64(300), *job.Spec.ActiveDeadlineSeconds)
+	require.Equal(t, int32(0), *job.Spec.BackoffLimit)
+	require.False(t, *job.Spec.Template.Spec.AutomountServiceAccountToken)
+	require.False(t, job.Spec.Template.Spec.HostNetwork)
+	require.Len(t, job.Spec.Template.Spec.Containers, 1)
+	container := job.Spec.Template.Spec.Containers[0]
+	require.Equal(t, hermesTestImage, container.Image)
+	require.Equal(t, []string{"python", "-c"}, container.Command)
+	require.Equal(t, corev1.TerminationMessageFallbackToLogsOnError, container.TerminationMessagePolicy)
+	require.Contains(t, container.Args[0], "hashlib.sha256")
+	require.Contains(t, container.Args[0], "zipfile.ZipFile")
+	require.Equal(t, ref.Digest, container.Args[1])
+	require.Empty(t, container.Env)
+	require.Equal(t, "1", container.Resources.Limits.Cpu().String())
+	require.Equal(t, "1Gi", container.Resources.Limits.Memory().String())
+	require.Equal(t, "2Gi", container.Resources.Limits.StorageEphemeral().String())
+	require.Len(t, job.Spec.Template.Spec.Volumes, 2)
+	projections := job.Spec.Template.Spec.Volumes[1].Projected.Sources
+	require.Len(t, projections, 3)
+	for i, name := range ref.SecretNames() {
+		require.Equal(t, name, projections[i].Secret.Name)
+		require.Equal(t, "part", projections[i].Secret.Items[0].Key)
+		require.Equal(t, []string{"000", "001", "002"}[i], projections[i].Secret.Items[0].Path)
+	}
+	require.NoError(t, a.DeleteHermesBootstrap(ctx, "agent-seeded-fox"))
+	require.NoError(t, a.DeleteHermesBootstrap(ctx, "agent-seeded-fox"))
+
+	store := profilebundle.NewStore(kube, "hermes-agents")
+	staged, err := store.Stage(ctx, profilebundle.Bundle{Files: []profilebundle.File{{
+		Path: "distribution.yaml", Content: []byte("name: seeded-fox\n"),
+	}}})
+	require.NoError(t, err)
+	require.NoError(t, a.DeleteHermesSeed(ctx, staged))
+	require.NoError(t, a.DeleteHermesSeed(ctx, staged))
+	for _, name := range staged.SecretNames() {
+		_, err := kube.CoreV1().Secrets("hermes-agents").Get(ctx, name, metav1.GetOptions{})
+		require.True(t, apierrors.IsNotFound(err))
+	}
+}
+
+func TestBootstrapHermesPVCReportsJobFailure(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "agent-failed-owl-bootstrap", Namespace: "hermes-agents",
+			Labels: map[string]string{batchv1.JobNameLabel: "agent-failed-owl"},
+		},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "bootstrap", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				Reason: "Error", Message: "profile bundle SHA-256 mismatch",
+			}},
+		}}},
+	})
+	a := New(config.Config{SandboxNamespace: "hermes-agents", HermesImage: hermesTestImage}, nil, kube)
+	completeHermesBootstrapJob(t, ctx, kube, "agent-failed-owl", batchv1.JobFailed, "DeadlineExceeded", "bootstrap exceeded its deadline")
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.BootstrapHermesPVC, BootstrapHermesPVCInput{
+		AgentID: "agent-failed-owl",
+		Seed: profilebundle.Ref{
+			ID: strings.Repeat("a", 32), Parts: 1, Digest: strings.Repeat("b", 64),
+		},
+	})
+
+	require.ErrorContains(t, err, "DeadlineExceeded: bootstrap exceeded its deadline")
+	require.ErrorContains(t, err, "profile bundle SHA-256 mismatch")
+}
+
+func TestBootstrapHermesPVCRejectsJobFromDifferentSeed(t *testing.T) {
+	kube := fake.NewClientset(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name:        "agent-seeded-fox",
+		Namespace:   "hermes-agents",
+		Annotations: map[string]string{hermesSeedIDAnnotation: strings.Repeat("a", 32)},
+	}})
+	a := New(config.Config{SandboxNamespace: "hermes-agents", HermesImage: hermesTestImage}, nil, kube)
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment()
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.BootstrapHermesPVC, BootstrapHermesPVCInput{
+		AgentID: "agent-seeded-fox",
+		Seed:    profilebundle.Ref{ID: strings.Repeat("b", 32), Parts: 1, Digest: strings.Repeat("c", 64)},
+	})
+
+	require.ErrorContains(t, err, "belongs to a different seed")
+}
+
+func completeHermesBootstrapJob(t *testing.T, ctx context.Context, kube *fake.Clientset, agentID string, condition batchv1.JobConditionType, reason, message string) {
+	t.Helper()
+	go func() {
+		for {
+			job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			require.NoError(t, err)
+			job.Status.Conditions = []batchv1.JobCondition{{
+				Type: condition, Status: corev1.ConditionTrue, Reason: reason, Message: message,
+			}}
+			_, err = kube.BatchV1().Jobs("hermes-agents").UpdateStatus(ctx, job, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			return
+		}
+	}()
 }
 
 func TestAwaitHermesReadyReportsTerminalSandboxFailure(t *testing.T) {

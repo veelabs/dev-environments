@@ -1,5 +1,17 @@
-# Agent egress is intentionally unrestricted. Ingress reaches only the
-# dashboard from Traefik and the API from the router identity.
+# Bootstrap pods are offline. Runtime agent egress remains unrestricted while
+# ingress reaches only the dashboard from Traefik and API from the router.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-bootstrap-deny-all
+spec:
+  podSelector:
+    matchLabels:
+      renala.dev/hermes-bootstrap: "true"
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress: []
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

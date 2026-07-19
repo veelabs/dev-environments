@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,7 +23,53 @@ import (
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
+
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 )
+
+const (
+	hermesSeedIDAnnotation = "renala.dev/hermes-seed-id"
+	hermesBootstrapLabel   = "renala.dev/hermes-bootstrap"
+)
+
+const hermesBootstrapScript = `
+import hashlib
+import io
+import pathlib
+import sys
+import zipfile
+
+archive = b"".join(path.read_bytes() for path in sorted(pathlib.Path("/seed").iterdir()))
+digest = hashlib.sha256(archive).hexdigest()
+if digest != sys.argv[1]:
+    raise SystemExit(f"profile bundle SHA-256 mismatch: expected {sys.argv[1]}, got {digest}")
+root = pathlib.Path("/opt/data").resolve()
+with zipfile.ZipFile(io.BytesIO(archive)) as source:
+    for member in source.infolist():
+        target = (root / member.filename).resolve()
+        if target != root and root not in target.parents:
+            raise SystemExit(f"profile bundle contains unsafe path: {member.filename}")
+    source.extractall(root)
+`
+
+type CreateHermesPVCInput struct {
+	AgentID string
+	SeedID  string
+}
+
+type CreateHermesPVCOutput struct {
+	Seedable bool
+}
+
+type DeleteHermesSeedPVCInput struct {
+	AgentID string
+	SeedID  string
+}
+
+type BootstrapHermesPVCInput struct {
+	AgentID string
+	Seed    profilebundle.Ref
+}
 
 type CreateHermesCredentialsInput struct {
 	AgentID string
@@ -56,9 +103,9 @@ func hermesLabels(agentID string) map[string]string {
 	}
 }
 
-func (a *Activities) CreateHermesPVC(ctx context.Context, agentID string) error {
+func (a *Activities) CreateHermesPVC(ctx context.Context, in CreateHermesPVCInput) (CreateHermesPVCOutput, error) {
 	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: agentID, Namespace: a.cfg.SandboxNamespace, Labels: hermesLabels(agentID)},
+		ObjectMeta: metav1.ObjectMeta{Name: in.AgentID, Namespace: a.cfg.SandboxNamespace, Labels: hermesLabels(in.AgentID)},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: &a.cfg.HermesStorageClass,
@@ -67,11 +114,191 @@ func (a *Activities) CreateHermesPVC(ctx context.Context, agentID string) error 
 			}},
 		},
 	}
+	if in.SeedID != "" {
+		pvc.Annotations = map[string]string{hermesSeedIDAnnotation: in.SeedID}
+	}
 	_, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Create(ctx, pvc, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		existing, getErr := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Get(ctx, in.AgentID, metav1.GetOptions{})
+		if getErr != nil {
+			return CreateHermesPVCOutput{}, getErr
+		}
+		return CreateHermesPVCOutput{Seedable: in.SeedID != "" && existing.Annotations[hermesSeedIDAnnotation] == in.SeedID}, nil
+	}
+	return CreateHermesPVCOutput{Seedable: err == nil}, err
+}
+
+func (a *Activities) DeleteHermesSeedPVC(ctx context.Context, in DeleteHermesSeedPVCInput) error {
+	if in.SeedID == "" {
+		return nil
+	}
+	pvc, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Get(ctx, in.AgentID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil || pvc.Annotations[hermesSeedIDAnnotation] != in.SeedID {
+		return err
+	}
+	options := metav1.DeleteOptions{}
+	if pvc.UID != "" {
+		options.Preconditions = &metav1.Preconditions{UID: &pvc.UID}
+	}
+	err = a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Delete(ctx, in.AgentID, options)
+	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	return err
+}
+
+func (a *Activities) BootstrapHermesPVC(ctx context.Context, in BootstrapHermesPVCInput) error {
+	if err := in.Seed.Validate(); err != nil {
+		return temporal.NewNonRetryableApplicationError("invalid Hermes profile reference", "InvalidProfileReference", err)
+	}
+	activeDeadlineSeconds := int64(300)
+	backoffLimit := int32(0)
+	automountServiceAccountToken := false
+	enableServiceLinks := false
+	defaultMode := int32(0o400)
+	parts := make([]corev1.VolumeProjection, 0, in.Seed.Parts)
+	for i, name := range in.Seed.SecretNames() {
+		parts = append(parts, corev1.VolumeProjection{Secret: &corev1.SecretProjection{
+			LocalObjectReference: corev1.LocalObjectReference{Name: name},
+			Items:                []corev1.KeyToPath{{Key: "part", Path: fmt.Sprintf("%03d", i)}},
+		}})
+	}
+	podLabels := hermesLabels(in.AgentID)
+	podLabels[hermesBootstrapLabel] = "true"
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        in.AgentID,
+			Namespace:   a.cfg.SandboxNamespace,
+			Labels:      podLabels,
+			Annotations: map[string]string{hermesSeedIDAnnotation: in.Seed.ID},
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds: &activeDeadlineSeconds,
+			BackoffLimit:          &backoffLimit,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken: &automountServiceAccountToken,
+					EnableServiceLinks:           &enableServiceLinks,
+					RestartPolicy:                corev1.RestartPolicyNever,
+					SecurityContext: &corev1.PodSecurityContext{
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					Containers: []corev1.Container{{
+						Name:                     "bootstrap",
+						Image:                    a.cfg.HermesImage,
+						Command:                  []string{"python", "-c"},
+						Args:                     []string{hermesBootstrapScript, in.Seed.Digest},
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+						Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+							corev1.ResourceCPU:              resource.MustParse("1"),
+							corev1.ResourceMemory:           resource.MustParse("1Gi"),
+							corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+						}},
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: &automountServiceAccountToken,
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "data", MountPath: "/opt/data"},
+							{Name: "seed", MountPath: "/seed", ReadOnly: true},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: in.AgentID}}},
+						{Name: "seed", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: parts, DefaultMode: &defaultMode}}},
+					},
+				},
+			},
+		},
+	}
+	if _, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		activity.RecordHeartbeat(ctx, "waiting for Hermes profile bootstrap")
+		job, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Get(ctx, job.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get Hermes bootstrap Job %s: %w", job.Name, err)
+		}
+		if job.Annotations[hermesSeedIDAnnotation] != in.Seed.ID {
+			return fmt.Errorf("Hermes bootstrap Job %s belongs to a different seed", job.Name)
+		}
+		for _, condition := range job.Status.Conditions {
+			if condition.Status != corev1.ConditionTrue {
+				continue
+			}
+			switch condition.Type {
+			case batchv1.JobComplete:
+				return nil
+			case batchv1.JobFailed:
+				diagnostic := strings.TrimSpace(condition.Reason + ": " + condition.Message)
+				if podDiagnostic := a.hermesBootstrapPodDiagnostic(ctx, in.AgentID); podDiagnostic != "" {
+					diagnostic = strings.TrimSpace(diagnostic + ": " + podDiagnostic)
+				}
+				return fmt.Errorf("Hermes bootstrap Job %s failed: %s", job.Name, diagnostic)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Hermes bootstrap Job %s did not complete: %w", job.Name, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+func (a *Activities) hermesBootstrapPodDiagnostic(ctx context.Context, agentID string) string {
+	pods, err := a.kube.CoreV1().Pods(a.cfg.SandboxNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{batchv1.JobNameLabel: agentID}.AsSelector().String(),
+	})
+	if err != nil {
+		return ""
+	}
+	for _, pod := range pods.Items {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name != "bootstrap" || status.State.Terminated == nil {
+				continue
+			}
+			terminated := status.State.Terminated
+			return strings.TrimSpace(terminated.Reason + ": " + terminated.Message)
+		}
+	}
+	return ""
+}
+
+func (a *Activities) DeleteHermesBootstrap(ctx context.Context, agentID string) error {
+	name := agentID
+	foreground := metav1.DeletePropagationForeground
+	jobErr := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground})
+	if jobErr != nil && !apierrors.IsNotFound(jobErr) {
+		return jobErr
+	}
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		_, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+	return nil
+}
+
+func (a *Activities) DeleteHermesSeed(ctx context.Context, ref profilebundle.Ref) error {
+	return profilebundle.NewStore(a.kube, a.cfg.SandboxNamespace).Delete(ctx, ref)
 }
 
 func (a *Activities) CreateHermesCredentials(ctx context.Context, in CreateHermesCredentialsInput) error {

@@ -3,16 +3,22 @@ set -euo pipefail
 
 chart="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
-trap 'rm -f "$rendered"' EXIT
+rendered_custom="$(mktemp)"
+trap 'rm -f "$rendered" "$rendered_custom"' EXIT
 
 helm lint "$chart" --set-string baseDomain=example.test \
   --set-string router.hostname=homelab-server.example.ts.net
 helm template hermes-agents "$chart" --namespace hermes-agents \
 	--set-string baseDomain=example.test \
 	--set-string router.hostname=homelab-server.example.ts.net >"$rendered"
+helm template hermes-agents "$chart" --namespace hermes-agents \
+	--set-string baseDomain=example.test \
+	--set-string router.hostname=homelab-server.example.ts.net \
+	--set-string 'hermes.gitAllowedHosts[0]=github.com' \
+	--set-string 'hermes.gitAllowedHosts[1]=gitlab.com' >"$rendered_custom"
 
 assert_rendered() {
-  grep -Fq "$1" "$rendered" || {
+  grep -Fq "$1" "${2:-$rendered}" || {
     echo "missing rendered contract: $1" >&2
     return 1
   }
@@ -34,9 +40,9 @@ assert_rendered 'name: hermes-landing'
 assert_rendered 'value: "hermes"'
 assert_rendered 'host: "agents.example.test"'
 assert_rendered 'path: /healthz'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.5.0'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.6.0'
-assert_rendered 'verbs: ["get"]'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.6.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.7.0'
+assert_rendered 'verbs: ["get", "list"]'
 assert_rendered 'verbs: ["get", "list", "watch", "create", "delete", "update"]'
 assert_rendered 'name: hermes-api-router'
 assert_rendered 'app: hermes-api-router'
@@ -46,3 +52,16 @@ assert_rendered 'node-role.kubernetes.io/control-plane: "true"'
 assert_rendered 'cidr: 100.64.0.0/10'
 assert_rendered 'value: ".hermes-agents.svc.cluster.local:8642"'
 assert_rendered 'value: "http://homelab-server.example.ts.net:30864"'
+assert_rendered 'name: HERMES_GIT_ALLOWED_HOSTS'
+assert_rendered 'value: "github.com"'
+assert_rendered 'value: "github.com,gitlab.com"' "$rendered_custom"
+assert_rendered 'mountPath: /tmp'
+assert_rendered 'sizeLimit: 64Mi'
+assert_rendered 'ephemeral-storage: 16Mi'
+assert_rendered 'ephemeral-storage: 64Mi'
+assert_rendered 'resources: ["jobs"]'
+assert_rendered 'verbs: ["get", "list", "watch", "create", "delete"]'
+assert_rendered 'verbs: ["get", "list", "create", "delete"]'
+assert_rendered 'name: hermes-bootstrap-deny-all'
+assert_rendered 'renala.dev/hermes-bootstrap: "true"'
+assert_rendered 'policyTypes: ["Ingress", "Egress"]'

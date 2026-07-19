@@ -14,6 +14,7 @@ import (
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/activities"
+	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 )
 
 const hermesWorkflowTestImage = "docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:release"
@@ -25,6 +26,10 @@ func hermesEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	e.RegisterWorkflow(ProvisionHermesAgent)
 	var a *activities.Activities
 	e.RegisterActivity(a.CreateHermesPVC)
+	e.RegisterActivity(a.DeleteHermesSeedPVC)
+	e.RegisterActivity(a.BootstrapHermesPVC)
+	e.RegisterActivity(a.DeleteHermesBootstrap)
+	e.RegisterActivity(a.DeleteHermesSeed)
 	e.RegisterActivity(a.CreateHermesCredentials)
 	e.RegisterActivity(a.CreateHermesSandbox)
 	e.RegisterActivity(a.AwaitHermesReady)
@@ -41,14 +46,28 @@ func hermesEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	return e
 }
 
-func TestHermesAgentStopsAndStartsAgainstRetainedState(t *testing.T) {
+func TestHermesSeedBootstrapsOnceBeforeStopAndStart(t *testing.T) {
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
+	seed := profilebundle.Ref{ID: "seed-123", Parts: 2, Digest: "digest"}
+	var order []string
 
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-calm-fox").Return(nil).Once()
-	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).Return(nil).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-calm-fox", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Run(func(mock.Arguments) {
+		order = append(order, "pvc")
+	}).Once()
+	e.OnActivity("BootstrapHermesPVC", mock.Anything, activities.BootstrapHermesPVCInput{
+		AgentID: "agent-calm-fox", Seed: seed,
+	}).Return(nil).Run(func(mock.Arguments) { order = append(order, "bootstrap") }).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-calm-fox").
+		Return(nil).Run(func(mock.Arguments) { order = append(order, "delete-bootstrap") }).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).
+		Return(nil).Run(func(mock.Arguments) { order = append(order, "delete-seed") }).Once()
+	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).
+		Return(nil).Run(func(mock.Arguments) { order = append(order, "credentials") }).Once()
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-calm-fox").
-		Return(hermesWorkflowTestImage, nil).Twice()
+		Return(hermesWorkflowTestImage, nil).Run(func(mock.Arguments) { order = append(order, "sandbox") }).Twice()
 	e.OnActivity("AwaitHermesReady", mock.Anything, "agent-calm-fox").
 		Return(activities.AwaitHermesReadyOutput{
 			Selector: "agents.x-k8s.io/sandbox-name-hash=abc123",
@@ -86,9 +105,11 @@ func TestHermesAgentStopsAndStartsAgainstRetainedState(t *testing.T) {
 		e.CancelWorkflow()
 	}, 3*time.Minute)
 
-	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "calm-fox"})
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "calm-fox", Seed: &seed})
 
 	require.Error(t, e.GetWorkflowError())
+	require.GreaterOrEqual(t, len(order), 6)
+	require.Equal(t, []string{"pvc", "bootstrap", "delete-bootstrap", "delete-seed", "credentials", "sandbox"}, order[:6])
 	e.AssertExpectations(t)
 }
 
@@ -96,7 +117,8 @@ func TestHermesAgentRotatesCredentialsThroughControlledRestart(t *testing.T) {
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-brave-otter"})
 
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-brave-otter").Return(nil).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{AgentID: "agent-brave-otter"}).
+		Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
 	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).Return(nil).Once()
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-brave-otter").
 		Return(hermesWorkflowTestImage, nil).Twice()
@@ -192,7 +214,15 @@ func TestHermesAgentContinuesAsNewWithQueryableState(t *testing.T) {
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
 	e.SetContinueAsNewSuggested(true)
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	seed := profilebundle.Ref{ID: "seed-continue", Parts: 1, Digest: "digest"}
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-calm-fox", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
+	e.OnActivity("BootstrapHermesPVC", mock.Anything, activities.BootstrapHermesPVCInput{
+		AgentID: "agent-calm-fox", Seed: seed,
+	}).Return(nil).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).Return(nil).Once()
 	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).Return(nil).Once()
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-calm-fox").
 		Return(hermesWorkflowTestImage, nil).Twice()
@@ -213,13 +243,14 @@ func TestHermesAgentContinuesAsNewWithQueryableState(t *testing.T) {
 		e.SignalWorkflow(HermesOperationSignal, HermesOperation{Type: HermesOperationStart})
 	}, time.Minute)
 
-	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "calm-fox"})
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "calm-fox", Seed: &seed})
 
 	var continueErr *sdkworkflow.ContinueAsNewError
 	require.ErrorAs(t, e.GetWorkflowError(), &continueErr)
 	var continued HermesInput
 	require.NoError(t, converter.GetDefaultDataConverter().FromPayloads(continueErr.Input, &continued))
 	require.True(t, continued.Initialized)
+	require.Nil(t, continued.Seed)
 	require.Equal(t, HermesPhaseRunning, continued.State.Phase)
 	require.Equal(t, "https://agent-calm-fox.renala.dev", continued.State.DashboardURL)
 	e.AssertExpectations(t)
@@ -247,9 +278,10 @@ func TestHermesAgentContinuesAsNewWithQueryableState(t *testing.T) {
 func TestHermesAgentRetriesPersistentSetupBeforeStart(t *testing.T) {
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-calm-fox").
-		Return(temporal.NewNonRetryableApplicationError("storage unavailable", "StorageUnavailable", nil)).Once()
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{AgentID: "agent-calm-fox"}).
+		Return(activities.CreateHermesPVCOutput{}, temporal.NewNonRetryableApplicationError("storage unavailable", "StorageUnavailable", nil)).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{AgentID: "agent-calm-fox"}).
+		Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
 	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).Return(nil).Once()
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-calm-fox").Return(hermesWorkflowTestImage, nil).Once()
 	e.OnActivity("AwaitHermesReady", mock.Anything, "agent-calm-fox").Return(activities.AwaitHermesReadyOutput{
@@ -284,7 +316,8 @@ func TestHermesAgentReportsFailedPhaseAndCompensatesRuntime(t *testing.T) {
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-brave-otter"})
 
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-brave-otter").Return(nil).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{AgentID: "agent-brave-otter"}).
+		Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
 	e.OnActivity("CreateHermesCredentials", mock.Anything, mock.Anything).Return(nil).Once()
 	e.OnActivity("CreateHermesSandbox", mock.Anything, "agent-brave-otter").
 		Return(hermesWorkflowTestImage, nil).Once()
@@ -293,6 +326,7 @@ func TestHermesAgentReportsFailedPhaseAndCompensatesRuntime(t *testing.T) {
 	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-brave-otter").Return(nil).Once()
 	e.OnActivity("DeleteHermesService", mock.Anything, "agent-brave-otter").Return(nil).Once()
 	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-brave-otter").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-brave-otter").Return(nil).Once()
 
 	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "brave-otter"})
 
@@ -311,7 +345,8 @@ func TestHermesAgentReachesHealthyDashboardAndRetainsStateOnCancellation(t *test
 	e := hermesEnv(t)
 	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
 
-	e.OnActivity("CreateHermesPVC", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{AgentID: "agent-calm-fox"}).
+		Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
 	e.OnActivity("CreateHermesCredentials", mock.Anything, activities.CreateHermesCredentialsInput{
 		AgentID: "agent-calm-fox",
 		Soul:    "# Calm Fox\n",
@@ -349,6 +384,140 @@ func TestHermesAgentReachesHealthyDashboardAndRetainsStateOnCancellation(t *test
 	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "calm-fox", Soul: "# Calm Fox\n"})
 
 	require.True(t, e.IsWorkflowCompleted())
+	e.AssertExpectations(t)
+}
+
+func TestHermesSeedBootstrapFailureCompensatesAndIsTerminalForStart(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-failed-owl"})
+	seed := profilebundle.Ref{ID: "seed-failed", Parts: 1, Digest: "digest"}
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-failed-owl", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
+	e.OnActivity("BootstrapHermesPVC", mock.Anything, activities.BootstrapHermesPVCInput{
+		AgentID: "agent-failed-owl", Seed: seed,
+	}).Return(errors.New("profile bundle SHA-256 mismatch")).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-failed-owl").Return(nil).Twice()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).
+		Return(temporal.NewNonRetryableApplicationError("Kubernetes unavailable", "DeleteFailed", nil)).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).Return(nil).Once()
+	e.OnActivity("DeleteHermesSeedPVC", mock.Anything, activities.DeleteHermesSeedPVCInput{
+		AgentID: "agent-failed-owl", SeedID: seed.ID,
+	}).Return(nil).Twice()
+	e.OnActivity("InspectHermesResources", mock.Anything, "agent-failed-owl").
+		Return(activities.HermesResources{}, nil).Once()
+	e.OnActivity("DeleteHermesCredentials", mock.Anything, "agent-failed-owl").Return(nil).Once()
+	e.RegisterDelayedCallback(func() {
+		e.SignalWorkflow(HermesOperationSignal, HermesOperation{Type: HermesOperationStart})
+	}, 2*time.Minute)
+	e.RegisterDelayedCallback(func() {
+		value, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var status HermesStatus
+		require.NoError(t, value.Get(&status))
+		require.Equal(t, HermesPhaseError, status.Phase)
+		require.Contains(t, status.LastError, "bootstrap")
+		e.SignalWorkflow(HermesOperationSignal, HermesOperation{
+			Type: HermesOperationForget, Confirmation: "agent-failed-owl",
+		})
+	}, 3*time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "failed-owl", Seed: &seed})
+
+	require.NoError(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
+}
+
+func TestHermesSeedRejectsExistingPVCWithoutDeletingIt(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-existing-owl"})
+	seed := profilebundle.Ref{ID: "seed-existing", Parts: 1, Digest: "digest"}
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-existing-owl", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{Seedable: false}, nil).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-existing-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).Return(nil).Once()
+	e.OnActivity("DeleteHermesSeedPVC", mock.Anything, activities.DeleteHermesSeedPVCInput{
+		AgentID: "agent-existing-owl", SeedID: seed.ID,
+	}).Return(nil).Once()
+	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-existing-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesService", mock.Anything, "agent-existing-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-existing-owl").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-existing-owl").Return(nil).Once()
+	e.RegisterDelayedCallback(func() {
+		value, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var status HermesStatus
+		require.NoError(t, value.Get(&status))
+		require.Equal(t, HermesPhaseError, status.Phase)
+		require.Contains(t, status.LastError, "requires a new persistent volume")
+		e.CancelWorkflow()
+	}, time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "existing-owl", Seed: &seed})
+
+	require.Error(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
+}
+
+func TestHermesSeedCancellationCleansBootstrapSeedAndPVC(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-cancelled-owl"})
+	seed := profilebundle.Ref{ID: "seed-cancelled", Parts: 1, Digest: "digest"}
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-cancelled-owl", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{Seedable: true}, nil).Once()
+	e.OnActivity("BootstrapHermesPVC", mock.Anything, mock.Anything).Return(nil).After(2 * time.Minute).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-cancelled-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).Return(nil).Once()
+	e.OnActivity("DeleteHermesSeedPVC", mock.Anything, activities.DeleteHermesSeedPVCInput{
+		AgentID: "agent-cancelled-owl", SeedID: seed.ID,
+	}).Return(nil).Once()
+	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-cancelled-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesService", mock.Anything, "agent-cancelled-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-cancelled-owl").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-cancelled-owl").Return(nil).Once()
+	e.RegisterDelayedCallback(e.CancelWorkflow, time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "cancelled-owl", Seed: &seed})
+
+	require.Error(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
+}
+
+func TestHermesSeedCreateUnknownOutcomeRetriesCleanupOnExit(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-unknown-owl"})
+	seed := profilebundle.Ref{ID: "seed-unknown", Parts: 1, Digest: "digest"}
+	guard := activities.DeleteHermesSeedPVCInput{AgentID: "agent-unknown-owl", SeedID: seed.ID}
+	e.OnActivity("CreateHermesPVC", mock.Anything, activities.CreateHermesPVCInput{
+		AgentID: "agent-unknown-owl", SeedID: seed.ID,
+	}).Return(activities.CreateHermesPVCOutput{}, temporal.NewNonRetryableApplicationError(
+		"PVC create response lost", "UnknownCreateOutcome", nil,
+	)).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-unknown-owl").Return(
+		temporal.NewNonRetryableApplicationError("cleanup interrupted", "CleanupFailed", nil),
+	).Once()
+	e.OnActivity("DeleteHermesBootstrap", mock.Anything, "agent-unknown-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSeed", mock.Anything, seed).Return(nil).Twice()
+	e.OnActivity("DeleteHermesSeedPVC", mock.Anything, guard).Return(nil).Twice()
+	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-unknown-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesService", mock.Anything, "agent-unknown-owl").Return(nil).Once()
+	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-unknown-owl").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-unknown-owl").Return(nil).Once()
+	e.RegisterDelayedCallback(func() {
+		value, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var status HermesStatus
+		require.NoError(t, value.Get(&status))
+		require.Equal(t, HermesPhaseError, status.Phase)
+		require.Contains(t, status.LastError, "PVC create response lost")
+		e.CancelWorkflow()
+	}, time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{Name: "unknown-owl", Seed: &seed})
+
+	require.Error(t, e.GetWorkflowError())
 	e.AssertExpectations(t)
 }
 
