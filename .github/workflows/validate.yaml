@@ -47,7 +47,8 @@ jobs:
           test "$(docker inspect --format '{{.Config.User}}' sandbox-smoke)" = node
           docker run --rm sandbox-smoke sh -ceu \
             'command -v opencode openchamber git curl jq rg unzip'
-          docker run -d --name sandbox-smoke -p 3000:3000 sandbox-smoke
+          docker run -d --name sandbox-smoke -p 3000:3000 \
+            -e OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN=true sandbox-smoke
 
           docker build -t landing-smoke -f images/landing/Dockerfile .
           test "$(docker inspect --format '{{.Config.User}}' landing-smoke)" = nonroot
@@ -64,7 +65,7 @@ jobs:
 
           trap 'docker logs sandbox-smoke; docker logs landing-smoke; docker rm -f sandbox-smoke landing-smoke' EXIT
           for _ in $(seq 1 120); do
-            if curl -fsS http://127.0.0.1:3000/ >/dev/null &&
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null &&
                test "$(curl -sS -o router.json -w '%{http_code}' http://127.0.0.1:8642/)" = 400; then
               grep -Fq 'missing-agent' router.json
               exit 0
