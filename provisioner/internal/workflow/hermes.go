@@ -66,12 +66,22 @@ type HermesStatus struct {
 }
 
 type HermesBackupStatus struct {
-	Phase         string `json:"phase,omitempty"`
-	LastAttemptAt string `json:"lastAttemptAt,omitempty"`
-	LastSuccessAt string `json:"lastSuccessAt,omitempty"`
-	SnapshotID    string `json:"snapshotId,omitempty"`
-	SnapshotTime  string `json:"snapshotTime,omitempty"`
-	LastError     string `json:"lastError,omitempty"`
+	Phase         string                       `json:"phase,omitempty"`
+	LastAttemptAt string                       `json:"lastAttemptAt,omitempty"`
+	LastSuccessAt string                       `json:"lastSuccessAt,omitempty"`
+	SnapshotID    string                       `json:"snapshotId,omitempty"`
+	SnapshotTime  string                       `json:"snapshotTime,omitempty"`
+	LastError     string                       `json:"lastError,omitempty"`
+	Scheduled     *HermesScheduledBackupStatus `json:"scheduled,omitempty"`
+}
+
+type HermesScheduledBackupStatus struct {
+	Active         bool   `json:"active"`
+	Schedule       string `json:"schedule"`
+	LastAttemptAt  string `json:"lastAttemptAt,omitempty"`
+	LastSuccessAt  string `json:"lastSuccessAt,omitempty"`
+	LastFailureAt  string `json:"lastFailureAt,omitempty"`
+	NextScheduleAt string `json:"nextScheduleAt,omitempty"`
 }
 
 var hermesNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
@@ -412,12 +422,14 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			}
 			var result activities.BackupHermesOutput
 			backupErr := workflow.ExecuteActivity(backupCtx, a.BackupHermes, agentID).Get(ctx, &result)
-			cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
-			cleanupShortCtx, _ := activityContexts(cleanupCtx)
-			if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesBackup, agentID).Get(cleanupCtx, nil); err != nil {
-				workflow.GetLogger(ctx).Error("Hermes backup pod cleanup failed", "agentID", agentID, "error", err)
+			if backupErr == nil {
+				cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
+				cleanupShortCtx, _ := activityContexts(cleanupCtx)
+				if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesBackup, agentID).Get(cleanupCtx, nil); err != nil {
+					workflow.GetLogger(ctx).Error("Hermes backup pod cleanup failed", "agentID", agentID, "error", err)
+				}
+				cancel()
 			}
-			cancel()
 			status.Phase = previousPhase
 			if backupErr != nil {
 				status.Backup.Phase = HermesBackupPhaseFailed

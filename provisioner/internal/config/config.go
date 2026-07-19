@@ -19,13 +19,15 @@ type Config struct {
 	BaseDomain        string
 	TraefikURL        string
 	// SandboxPort is the in-pod port OpenChamber listens on (template args).
-	SandboxPort            int
-	HermesImage            string
-	HermesStorageClass     string
-	HermesAPISecret        string
-	HermesResticImage      string
-	HermesBackupSecret     string
-	HermesBackupRepository string
+	SandboxPort                int
+	HermesImage                string
+	HermesStorageClass         string
+	HermesAPISecret            string
+	HermesResticImage          string
+	HermesBackupSecret         string
+	HermesBackupRepository     string
+	HermesBackupHourUTC        int
+	HermesBackupStaggerMinutes int
 }
 
 func get(key, def string) string {
@@ -59,6 +61,16 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("SANDBOX_PORT must be a valid port, got %q", get("SANDBOX_PORT", "1982"))
 	}
 	c.SandboxPort = port
+	backupHour, err := strconv.Atoi(get("HERMES_BACKUP_HOUR_UTC", "0"))
+	if err != nil || backupHour < 0 || backupHour > 23 {
+		return c, fmt.Errorf("HERMES_BACKUP_HOUR_UTC must be an hour from 0 to 23, got %q", get("HERMES_BACKUP_HOUR_UTC", "0"))
+	}
+	c.HermesBackupHourUTC = backupHour
+	staggerMinutes, err := strconv.Atoi(get("HERMES_BACKUP_STAGGER_MINUTES", "180"))
+	if err != nil || staggerMinutes < 1 || staggerMinutes > 1440 {
+		return c, fmt.Errorf("HERMES_BACKUP_STAGGER_MINUTES must be from 1 to 1440, got %q", get("HERMES_BACKUP_STAGGER_MINUTES", "180"))
+	}
+	c.HermesBackupStaggerMinutes = staggerMinutes
 	if c.BaseDomain == "" {
 		return c, fmt.Errorf("BASE_DOMAIN must not be empty")
 	}

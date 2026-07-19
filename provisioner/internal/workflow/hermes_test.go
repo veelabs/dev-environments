@@ -94,7 +94,7 @@ func TestHermesAgentRedactsBackupFailureAndKeepsRuntimePhase(t *testing.T) {
 		Return(activities.HermesResources{RuntimePresent: true, PVCPresent: true}, nil).Once()
 	e.OnActivity("BackupHermes", mock.Anything, "agent-calm-fox").
 		Return(activities.BackupHermesOutput{}, temporal.NewNonRetryableApplicationError("sftp failed with password super-secret", "HermesBackupFailed", nil)).Once()
-	e.OnActivity("DeleteHermesBackup", mock.Anything, "agent-calm-fox").Return(nil).Twice()
+	e.OnActivity("DeleteHermesBackup", mock.Anything, "agent-calm-fox").Return(nil).Once()
 	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-calm-fox").Return(nil).Once()
 	e.OnActivity("DeleteHermesService", mock.Anything, "agent-calm-fox").Return(nil).Once()
 	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-calm-fox").Return(nil).Once()

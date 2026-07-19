@@ -21,6 +21,10 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 	wf "github.com/veelabs/dev-environments/provisioner/internal/workflow"
@@ -235,7 +239,7 @@ func zipFiles(t *testing.T, files map[string]string) []byte {
 
 func newHermesTestServer(f *fakeTemporal) *Server {
 	return &Server{
-		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default", HermesAPISecret: "hermes-api", HermesAPIBaseURL: "http://homelab-server.example.ts.net:30864", HermesGitAllowedHosts: []string{"github.com"}},
+		cfg: Config{Kind: "hermes", TaskQueue: "hermes-agents", TemporalNamespace: "default", HermesNamespace: "hermes-agents", HermesAPISecret: "hermes-api", HermesAPIBaseURL: "http://homelab-server.example.ts.net:30864", HermesGitAllowedHosts: []string{"github.com"}},
 		tc:  f,
 	}
 }
@@ -470,6 +474,45 @@ func TestHermesListPaginatesVisibilityAndQueriesCurrentRuns(t *testing.T) {
 	require.Equal(t, []byte("next"), f.listRequests[1].NextPageToken)
 }
 
+func TestHermesListReportsScheduledBackupStatus(t *testing.T) {
+	lastAttempt := metav1.NewTime(time.Date(2026, 7, 18, 1, 17, 0, 0, time.UTC))
+	lastSuccess := metav1.NewTime(time.Date(2026, 7, 17, 1, 17, 0, 0, time.UTC))
+	lastFailure := metav1.NewTime(time.Date(2026, 7, 18, 1, 22, 0, 0, time.UTC))
+	f := &fakeTemporal{
+		listResponses:  []*workflowservice.ListWorkflowExecutionsResponse{{Executions: []*workflowpb.WorkflowExecutionInfo{workflowInfo("agent-calm-fox")}}},
+		hermesStatuses: map[string]wf.HermesStatus{"agent-calm-fox": {Phase: wf.HermesPhaseRunning, AgentID: "agent-calm-fox"}},
+	}
+	s := newHermesTestServer(f)
+	s.kube = fake.NewClientset(
+		&batchv1.CronJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "hermes-backup-ba478a6ba346da6d", Namespace: "hermes-agents"},
+			Spec:       batchv1.CronJobSpec{Schedule: "17 1 * * *", TimeZone: ptr("UTC")},
+			Status:     batchv1.CronJobStatus{LastScheduleTime: &lastAttempt, LastSuccessfulTime: &lastSuccess},
+		},
+		&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "hermes-backup-ba478a6ba346da6d-failed", Namespace: "hermes-agents", Labels: map[string]string{
+				"renala.dev/agent-id": "agent-calm-fox", "renala.dev/hermes-scheduled-backup": "true",
+			}},
+			Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, LastTransitionTime: lastFailure}}},
+		},
+	)
+	s.nowFunc = func() time.Time { return time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC) }
+	req := httptest.NewRequest(http.MethodGet, "/api/agents", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var statuses []wf.HermesStatus
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &statuses))
+	require.Equal(t, "17 1 * * *", statuses[0].Backup.Scheduled.Schedule)
+	require.Equal(t, "2026-07-18T01:17:00Z", statuses[0].Backup.Scheduled.LastAttemptAt)
+	require.Equal(t, "2026-07-17T01:17:00Z", statuses[0].Backup.Scheduled.LastSuccessAt)
+	require.Equal(t, "2026-07-18T01:22:00Z", statuses[0].Backup.Scheduled.LastFailureAt)
+	require.Equal(t, "2026-07-19T01:17:00Z", statuses[0].Backup.Scheduled.NextScheduleAt)
+}
+
+func ptr[T any](value T) *T { return &value }
+
 func TestHermesLifecycleRequestsSignalTheEntity(t *testing.T) {
 	f := &fakeTemporal{}
 	h := newHermesTestServer(f).Handler()
@@ -644,6 +687,8 @@ func TestServesDedicatedHermesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "X-Hermes-Agent")
 	require.Contains(t, rec.Body.String(), "Authorization")
 	require.Contains(t, rec.Body.String(), "Backup now")
+	require.Contains(t, rec.Body.String(), "last scheduled attempt")
+	require.Contains(t, rec.Body.String(), "next scheduled run")
 	require.NotContains(t, rec.Body.String(), `\n+`)
 	require.NotContains(t, rec.Body.String(), "provider key")
 }

@@ -12,3 +12,4 @@ annotations:
     3. Traefik ingress class and wildcard edge route
     4. local-path storage class
     5. Existing namespace API and backup credential Secrets
+    6. PrometheusRule monitoring.coreos.com/v1 CRD when monitoring is enabled

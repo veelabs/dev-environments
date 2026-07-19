@@ -12,13 +12,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robfig/cron"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/veelabs/dev-environments/provisioner/internal/activities"
 	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
 	wf "github.com/veelabs/dev-environments/provisioner/internal/workflow"
 )
@@ -65,6 +69,8 @@ type Server struct {
 	credentials  credentialStore
 	profileStore profileStore
 	acquireGit   func(context.Context, string, profilebundle.GitOptions) (profilebundle.Bundle, error)
+	kube         kubernetes.Interface
+	nowFunc      func() time.Time
 }
 
 // NewServer builds a Server backed by a real Temporal client.
@@ -78,6 +84,8 @@ func NewHermesServer(cfg Config, tc client.Client, kube kubernetes.Interface) *S
 		credentials:  kubeCredentialStore{kube: kube, namespace: cfg.HermesNamespace},
 		profileStore: profilebundle.NewStore(kube, cfg.HermesNamespace),
 		acquireGit:   profilebundle.AcquireGit,
+		kube:         kube,
+		nowFunc:      time.Now,
 	}
 }
 
@@ -184,6 +192,7 @@ func (s *Server) handleHermesList(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal", "message": "Could not read agent status. Try again shortly."})
 				return
 			}
+			s.enrichHermesScheduledBackup(r.Context(), &status)
 			statuses = append(statuses, status)
 		}
 		if len(response.NextPageToken) == 0 {
@@ -224,7 +233,74 @@ func (s *Server) handleHermesStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "temporal"})
 		return
 	}
+	s.enrichHermesScheduledBackup(r.Context(), &status)
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) enrichHermesScheduledBackup(ctx context.Context, status *wf.HermesStatus) {
+	if s.kube == nil {
+		return
+	}
+	cronJob, err := s.kube.BatchV1().CronJobs(s.cfg.HermesNamespace).Get(ctx, activities.HermesBackupResourceName(status.AgentID), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		log.Printf("read Hermes backup schedule %s: %v", status.AgentID, err)
+		return
+	}
+	scheduled := &wf.HermesScheduledBackupStatus{
+		Active:   cronJob.Spec.Suspend == nil || !*cronJob.Spec.Suspend,
+		Schedule: cronJob.Spec.Schedule,
+	}
+	if cronJob.Status.LastScheduleTime != nil {
+		scheduled.LastAttemptAt = cronJob.Status.LastScheduleTime.UTC().Format(time.RFC3339)
+	}
+	if cronJob.Status.LastSuccessfulTime != nil {
+		scheduled.LastSuccessAt = cronJob.Status.LastSuccessfulTime.UTC().Format(time.RFC3339)
+	}
+	jobs, err := s.kube.BatchV1().Jobs(s.cfg.HermesNamespace).List(ctx, metav1.ListOptions{LabelSelector: labels.Set{
+		"renala.dev/agent-id":                status.AgentID,
+		"renala.dev/hermes-scheduled-backup": "true",
+	}.AsSelector().String()})
+	if err != nil {
+		log.Printf("read Hermes scheduled backup Jobs %s: %v", status.AgentID, err)
+	} else {
+		var latestFailure time.Time
+		for _, job := range jobs.Items {
+			for _, condition := range job.Status.Conditions {
+				if condition.Type != "Failed" || condition.Status != "True" {
+					continue
+				}
+				failedAt := condition.LastTransitionTime.Time
+				if failedAt.IsZero() {
+					failedAt = job.CreationTimestamp.Time
+				}
+				if failedAt.After(latestFailure) {
+					latestFailure = failedAt
+				}
+			}
+		}
+		if !latestFailure.IsZero() {
+			scheduled.LastFailureAt = latestFailure.UTC().Format(time.RFC3339)
+		}
+	}
+	if scheduled.Active {
+		if parsed, err := cron.ParseStandard(cronJob.Spec.Schedule); err == nil {
+			now := time.Now()
+			if s.nowFunc != nil {
+				now = s.nowFunc()
+			}
+			location := time.UTC
+			if cronJob.Spec.TimeZone != nil {
+				if configured, err := time.LoadLocation(*cronJob.Spec.TimeZone); err == nil {
+					location = configured
+				}
+			}
+			scheduled.NextScheduleAt = parsed.Next(now.In(location)).UTC().Format(time.RFC3339)
+		}
+	}
+	status.Backup.Scheduled = scheduled
 }
 
 func (s *Server) handleHermesOperation(operation string) http.HandlerFunc {

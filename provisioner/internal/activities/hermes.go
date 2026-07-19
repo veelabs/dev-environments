@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,9 +30,10 @@ import (
 )
 
 const (
-	hermesSeedIDAnnotation = "renala.dev/hermes-seed-id"
-	hermesBootstrapLabel   = "renala.dev/hermes-bootstrap"
-	hermesBackupLabel      = "renala.dev/hermes-backup"
+	hermesSeedIDAnnotation     = "renala.dev/hermes-seed-id"
+	hermesBootstrapLabel       = "renala.dev/hermes-bootstrap"
+	hermesBackupLabel          = "renala.dev/hermes-backup"
+	hermesScheduledBackupLabel = "renala.dev/hermes-scheduled-backup"
 )
 
 const hermesBootstrapScript = `
@@ -190,9 +192,12 @@ func (a *Activities) CreateHermesPVC(ctx context.Context, in CreateHermesPVCInpu
 		if getErr != nil {
 			return CreateHermesPVCOutput{}, getErr
 		}
-		return CreateHermesPVCOutput{Seedable: in.SeedID != "" && existing.Annotations[hermesSeedIDAnnotation] == in.SeedID}, nil
+		return CreateHermesPVCOutput{Seedable: in.SeedID != "" && existing.Annotations[hermesSeedIDAnnotation] == in.SeedID}, a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 	}
-	return CreateHermesPVCOutput{Seedable: err == nil}, err
+	if err != nil {
+		return CreateHermesPVCOutput{}, err
+	}
+	return CreateHermesPVCOutput{Seedable: true}, a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 }
 
 func (a *Activities) DeleteHermesSeedPVC(ctx context.Context, in DeleteHermesSeedPVCInput) error {
@@ -201,7 +206,7 @@ func (a *Activities) DeleteHermesSeedPVC(ctx context.Context, in DeleteHermesSee
 	}
 	pvc, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Get(ctx, in.AgentID, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return nil
+		return a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 	}
 	if err != nil || pvc.Annotations[hermesSeedIDAnnotation] != in.SeedID {
 		return err
@@ -212,9 +217,12 @@ func (a *Activities) DeleteHermesSeedPVC(ctx context.Context, in DeleteHermesSee
 	}
 	err = a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Delete(ctx, in.AgentID, options)
 	if apierrors.IsNotFound(err) {
-		return nil
+		return a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 }
 
 func (a *Activities) BootstrapHermesPVC(ctx context.Context, in BootstrapHermesPVCInput) error {
@@ -367,22 +375,22 @@ func (a *Activities) deleteHermesJob(ctx context.Context, name string) error {
 	return nil
 }
 
-func hermesBackupJobName(agentID string) string {
+func HermesBackupResourceName(agentID string) string {
 	digest := sha256.Sum256([]byte(agentID))
 	return fmt.Sprintf("hermes-backup-%x", digest[:8])
 }
 
-func (a *Activities) BackupHermes(ctx context.Context, agentID string) (BackupHermesOutput, error) {
+func (a *Activities) hermesBackupJob(agentID string) *batchv1.Job {
 	activeDeadlineSeconds := int64(3600)
 	backoffLimit := int32(0)
 	ttlSecondsAfterFinished := int32(3600)
 	automountServiceAccountToken := false
 	enableServiceLinks := false
 	defaultMode := int32(0o400)
-	jobName := hermesBackupJobName(agentID)
+	jobName := HermesBackupResourceName(agentID)
 	podLabels := hermesLabels(agentID)
 	podLabels[hermesBackupLabel] = "true"
-	job := &batchv1.Job{
+	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: a.cfg.SandboxNamespace, Labels: podLabels},
 		Spec: batchv1.JobSpec{
 			ActiveDeadlineSeconds:   &activeDeadlineSeconds,
@@ -450,6 +458,11 @@ func (a *Activities) BackupHermes(ctx context.Context, agentID string) (BackupHe
 			},
 		},
 	}
+}
+
+func (a *Activities) BackupHermes(ctx context.Context, agentID string) (BackupHermesOutput, error) {
+	job := a.hermesBackupJob(agentID)
+	jobName := job.Name
 	if _, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return BackupHermesOutput{}, fmt.Errorf("create backup pod: %w", err)
 	}
@@ -484,6 +497,117 @@ func (a *Activities) BackupHermes(ctx context.Context, agentID string) (BackupHe
 	}
 }
 
+func (a *Activities) ReconcileHermesBackupSchedule(ctx context.Context, agentID string) error {
+	name := HermesBackupResourceName(agentID)
+	pvc, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).Get(ctx, agentID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		err = a.kube.BatchV1().CronJobs(a.cfg.SandboxNamespace).Delete(ctx, name, metav1.DeleteOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	job := a.hermesBackupJob(agentID)
+	job.Spec.TTLSecondsAfterFinished = nil
+	labels := hermesLabels(agentID)
+	labels[hermesBackupLabel] = "true"
+	labels[hermesScheduledBackupLabel] = "true"
+	job.Spec.Template.Labels[hermesScheduledBackupLabel] = "true"
+	successHistory := int32(1)
+	failureHistory := int32(3)
+	startingDeadline := int64(1800)
+	timeZone := "UTC"
+	suspend := false
+	staggerMinutes := a.cfg.HermesBackupStaggerMinutes
+	if staggerMinutes == 0 {
+		staggerMinutes = 180
+	}
+	cronJob := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: a.cfg.SandboxNamespace, Labels: labels,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1", Kind: "PersistentVolumeClaim", Name: pvc.Name, UID: pvc.UID,
+			}},
+		},
+		Spec: batchv1.CronJobSpec{
+			Schedule:                   hermesBackupSchedule(agentID, a.cfg.HermesBackupHourUTC, staggerMinutes),
+			TimeZone:                   &timeZone,
+			ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+			StartingDeadlineSeconds:    &startingDeadline,
+			Suspend:                    &suspend,
+			SuccessfulJobsHistoryLimit: &successHistory,
+			FailedJobsHistoryLimit:     &failureHistory,
+			JobTemplate: batchv1.JobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       job.Spec,
+			},
+		},
+	}
+	existing, err := a.kube.BatchV1().CronJobs(a.cfg.SandboxNamespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = a.kube.BatchV1().CronJobs(a.cfg.SandboxNamespace).Create(ctx, cronJob, metav1.CreateOptions{})
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Labels["renala.dev/agent-id"] != agentID || existing.Labels["app.kubernetes.io/managed-by"] != "hermes-provisioner" {
+		return temporal.NewNonRetryableApplicationError("backup schedule identity conflict", "BackupScheduleIdentityConflict", nil)
+	}
+	cronJob.ResourceVersion = existing.ResourceVersion
+	cronJob.Status = existing.Status
+	_, err = a.kube.BatchV1().CronJobs(a.cfg.SandboxNamespace).Update(ctx, cronJob, metav1.UpdateOptions{})
+	return err
+}
+
+func (a *Activities) ReconcileHermesBackupSchedules(ctx context.Context) error {
+	pvcs, err := a.kube.CoreV1().PersistentVolumeClaims(a.cfg.SandboxNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{"app.kubernetes.io/managed-by": "hermes-provisioner"}.AsSelector().String(),
+	})
+	if err != nil {
+		return err
+	}
+	retained := make(map[string]struct{}, len(pvcs.Items))
+	for _, pvc := range pvcs.Items {
+		retained[pvc.Name] = struct{}{}
+		if err := a.ReconcileHermesBackupSchedule(ctx, pvc.Name); err != nil {
+			return fmt.Errorf("reconcile backup schedule for %s: %w", pvc.Name, err)
+		}
+	}
+	cronJobs, err := a.kube.BatchV1().CronJobs(a.cfg.SandboxNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{
+			"app.kubernetes.io/managed-by": "hermes-provisioner",
+			hermesScheduledBackupLabel:     "true",
+		}.AsSelector().String(),
+	})
+	if err != nil {
+		return err
+	}
+	for _, cronJob := range cronJobs.Items {
+		agentID := cronJob.Labels["renala.dev/agent-id"]
+		if agentID == "" {
+			return fmt.Errorf("backup schedule %s has no agent identity", cronJob.Name)
+		}
+		if _, ok := retained[agentID]; ok {
+			continue
+		}
+		if err := a.ReconcileHermesBackupSchedule(ctx, agentID); err != nil {
+			return fmt.Errorf("remove orphaned backup schedule for %s: %w", agentID, err)
+		}
+	}
+	return nil
+}
+
+func hermesBackupSchedule(agentID string, hourUTC, staggerMinutes int) string {
+	digest := sha256.Sum256([]byte(agentID))
+	offset := int(binary.BigEndian.Uint32(digest[8:12])) % staggerMinutes
+	minuteOfDay := (hourUTC*60 + offset) % (24 * 60)
+	return fmt.Sprintf("%d %d * * *", minuteOfDay%60, minuteOfDay/60)
+}
+
 func (a *Activities) hermesBackupOutput(ctx context.Context, jobName string) (BackupHermesOutput, error) {
 	pods, err := a.kube.CoreV1().Pods(a.cfg.SandboxNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set{batchv1.JobNameLabel: jobName}.AsSelector().String(),
@@ -512,7 +636,7 @@ func (a *Activities) hermesBackupOutput(ctx context.Context, jobName string) (Ba
 }
 
 func (a *Activities) DeleteHermesBackup(ctx context.Context, agentID string) error {
-	return a.deleteHermesJob(ctx, hermesBackupJobName(agentID))
+	return a.deleteHermesJob(ctx, HermesBackupResourceName(agentID))
 }
 
 func (a *Activities) DeleteHermesSeed(ctx context.Context, ref profilebundle.Ref) error {
@@ -540,9 +664,12 @@ func (a *Activities) CreateHermesCredentials(ctx context.Context, in CreateHerme
 	}
 	_, err = a.kube.CoreV1().Secrets(a.cfg.SandboxNamespace).Create(ctx, secret, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		return nil
+		return a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return a.ReconcileHermesBackupSchedule(ctx, in.AgentID)
 }
 
 func randomCredential(bytes int) (string, error) {
