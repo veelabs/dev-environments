@@ -83,6 +83,9 @@ streams their current phase by polling, starts and stops retained runtimes, and
 reveals or rotates generated dashboard credentials. Stop removes the Sandbox,
 Service, and Ingress while retaining the workflow, `5Gi` PVC, Secret, and Hermes
 home. Literal Temporal cancellation remains the emergency runtime cleanup path.
+DeleteData takes a final verified backup before removing the PVC; the retained
+entity can then restore a selected agent-scoped NAS snapshot into a fresh PVC
+before starting and health-checking Hermes.
 
 ## Layout
 

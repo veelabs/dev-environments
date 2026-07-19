@@ -21,7 +21,7 @@
   h2 { margin:0 0 4px; font:700 22px Georgia,serif; }
   .hint { margin:0 0 20px; color:var(--muted); font-size:13px; }
   label { display:block; margin:15px 0 6px; font-weight:700; font-size:13px; }
-  input,textarea { width:100%; border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; outline:none; }
+  input,textarea,select { width:100%; border:1px solid var(--line); border-radius:10px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; outline:none; }
   input { font-family:ui-monospace,monospace; }
   textarea { min-height:220px; resize:vertical; line-height:1.55; }
   input:focus,textarea:focus { border-color:var(--violet); box-shadow:0 0 0 3px #5040a817; }
@@ -48,6 +48,9 @@
   .error { color:var(--red); margin:10px 0 0; font-size:13px; }
   .backup { margin:12px 0 0; padding:10px 12px; border-left:3px solid var(--violet); background:#f2eee7; }
   .backup p { margin:2px 0; }
+  .recovery { margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:10px; background:#fff; }
+  .recovery label { margin-top:0; }
+  .recovery .actions { margin-top:8px; }
   .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
   .actions .danger { color:var(--red); margin-left:auto; }
   .credentials { margin-top:12px; padding:12px; border-radius:10px; background:#f0ece3; font:13px ui-monospace,monospace; overflow-wrap:anywhere; }
@@ -95,6 +98,8 @@
   "use strict";
   const $ = id => document.getElementById(id);
   const busy = new Set();
+  const snapshotRequests = new Set();
+  const selectedSnapshots = new Map();
   let creatingID = "";
 
   async function json(url, options = {}) {
@@ -107,14 +112,16 @@
   }
 
   const escapeHTML = value => String(value || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
-  const transitional = phase => ["storage","bootstrap","credentials","starting","wiring","verifying","stopping","rotating-credentials","backing-up","forgetting"].includes(phase);
+  const transitional = phase => ["storage","bootstrap","credentials","starting","wiring","verifying","stopping","rotating-credentials","backing-up","deleting-data","restoring","forgetting"].includes(phase);
 
   function card(agent) {
     const id = escapeHTML(agent.agentId), phase = escapeHTML(agent.phase);
-    const running = agent.phase === "running", stopped = agent.phase === "stopped", failed = agent.phase === "error", bootstrapError = failed && String(agent.lastError || "").startsWith("bootstrap:"), locked = busy.has(agent.agentId) || transitional(agent.phase), backup = agent.backup || {}, scheduled = backup.scheduled || {};
+    const running = agent.phase === "running", stopped = agent.phase === "stopped", failed = agent.phase === "error", bootstrapError = failed && String(agent.lastError || "").startsWith("bootstrap:"), locked = busy.has(agent.agentId) || transitional(agent.phase), hasData = !!agent.dataPresent, cleanupPending = !!agent.restoreCleanupPending, dataConflict = !!agent.restoreDataConflict, schedulePending = !!agent.restoreSchedulePending, backup = agent.backup || {}, scheduled = backup.scheduled || {}, snapshots = agent.snapshots || [];
+    const selectedSnapshot = snapshots.some(snapshot => snapshot.snapshotId === selectedSnapshots.get(agent.agentId)) ? selectedSnapshots.get(agent.agentId) : snapshots[0]?.snapshotId;
     const backupDetails = backup.phase || scheduled.schedule ? `<div class="backup">${backup.phase ? `<p class="meta">manual backup: ${escapeHTML(backup.phase)}</p>` : ""}${backup.lastAttemptAt ? `<p class="meta">last manual attempt: ${escapeHTML(backup.lastAttemptAt)}</p>` : ""}${backup.lastSuccessAt ? `<p class="meta">last manual success: ${escapeHTML(backup.lastSuccessAt)}</p>` : ""}${backup.snapshotId ? `<p class="meta">snapshot: ${escapeHTML(backup.snapshotId)}${backup.snapshotTime ? ` · ${escapeHTML(backup.snapshotTime)}` : ""}</p>` : ""}${backup.lastError ? `<p class="error">${escapeHTML(backup.lastError)}</p>` : ""}${scheduled.schedule ? `<p class="meta">daily schedule: ${escapeHTML(scheduled.schedule)} UTC${scheduled.active ? "" : " (suspended)"}</p>` : ""}${scheduled.lastAttemptAt ? `<p class="meta">last scheduled attempt: ${escapeHTML(scheduled.lastAttemptAt)}</p>` : ""}${scheduled.lastSuccessAt ? `<p class="meta">last scheduled success: ${escapeHTML(scheduled.lastSuccessAt)}</p>` : ""}${scheduled.lastFailureAt ? `<p class="error">last scheduled failure: ${escapeHTML(scheduled.lastFailureAt)}</p>` : ""}${scheduled.nextScheduleAt ? `<p class="meta">next scheduled run: ${escapeHTML(scheduled.nextScheduleAt)}</p>` : ""}</div>` : "";
-    const forget = `<button class="danger" data-action="forget" ${(stopped || bootstrapError) && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
-    return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}${backupDetails}<div class="actions"><button data-action="start" ${running || bootstrapError || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || locked ? "disabled" : ""}>Stop</button><button data-action="backup" ${(running || stopped || failed) && !locked ? "" : "disabled"}>Backup now</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button>${forget}</div><div class="credentials" hidden></div></article>`;
+    const recovery = `<div class="recovery"><label for="snapshot-${id}">Restore point</label><select id="snapshot-${id}" data-snapshots ${snapshots.length ? "" : "disabled"}>${snapshots.length ? snapshots.map(snapshot => `<option value="${escapeHTML(snapshot.snapshotId)}" ${snapshot.snapshotId === selectedSnapshot ? "selected" : ""}>${escapeHTML(snapshot.snapshotTime)} · ${escapeHTML(snapshot.snapshotId)}</option>`).join("") : `<option>No restore points loaded</option>`}</select>${agent.snapshotError ? `<p class="error">${escapeHTML(agent.snapshotError)}</p>` : ""}<div class="actions"><button data-action="snapshots">Refresh restore points</button>${!hasData || schedulePending ? `<button data-action="restore" ${snapshots.length && !cleanupPending && !dataConflict && !locked ? "" : "disabled"}>${schedulePending ? "Retry restore finalization" : "Restore selected snapshot"}</button>` : ""}</div></div>`;
+    const forget = `<button class="danger" data-action="forget" ${(!hasData || bootstrapError) && !running && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
+    return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}${backupDetails}${recovery}<div class="actions"><button data-action="start" ${running || !hasData || cleanupPending || dataConflict || schedulePending || bootstrapError || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || !hasData || locked ? "disabled" : ""}>Stop</button><button data-action="backup" ${hasData && !cleanupPending && !schedulePending && !locked ? "" : "disabled"}>Backup now</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button><button class="danger" data-action="delete-data" ${hasData && !locked ? "" : "disabled"}>${cleanupPending ? "Delete incomplete restore data" : "Delete data"}</button>${agent.forceDeleteAllowed ? `<button class="danger" data-action="force-delete" ${locked ? "disabled" : ""}>Force delete data</button>` : ""}${forget}</div><div class="credentials" hidden></div></article>`;
   }
 
   async function load() {
@@ -125,6 +132,12 @@
         catch (_) { agents = [{agentId:creatingID, phase:"storage", lastError:"Workflow accepted; waiting for its status query to register."}, ...agents]; }
       } else if (creatingID) { creatingID = ""; }
       $("agents").innerHTML = agents.length ? agents.map(card).join("") : `<div class="panel empty">No agents yet. Create the first identity.</div>`;
+      for (const agent of agents) {
+        if (!agent.dataPresent && !(agent.snapshots || []).length && !snapshotRequests.has(agent.agentId)) {
+          snapshotRequests.add(agent.agentId);
+          json(`/api/agents/${encodeURIComponent(agent.agentId)}/snapshots/refresh`, {method:"POST", body:"{}"}).catch(() => snapshotRequests.delete(agent.agentId));
+        }
+      }
       $("list-error").textContent = "";
     } catch (error) { $("list-error").textContent = error.message; }
   }
@@ -152,6 +165,16 @@
       if (action === "forget") {
         const confirmation = prompt(`Type ${id} to forget this entity.`); if (confirmation !== id) return;
         await json(`/api/agents/${encodeURIComponent(id)}/forget`, {method:"POST", body:JSON.stringify({confirmation})});
+      } else if (action === "delete-data" || action === "force-delete") {
+        const force = action === "force-delete";
+        const confirmation = prompt(`${force ? "Final backup failed. Unsaved changes may be permanently lost. " : ""}Type ${id} to ${force ? "force " : ""}delete persistent data.`); if (confirmation !== id) return;
+        busy.add(id); await json(`/api/agents/${encodeURIComponent(id)}/data/delete`, {method:"POST", body:JSON.stringify({confirmation, force})});
+      } else if (action === "snapshots") {
+        snapshotRequests.add(id); busy.add(id); await json(`/api/agents/${encodeURIComponent(id)}/snapshots/refresh`, {method:"POST", body:"{}"});
+      } else if (action === "restore") {
+        const snapshotId = article.querySelector("[data-snapshots]").value;
+        if (!confirm(`Restore ${id} from snapshot ${snapshotId}?`)) return;
+        busy.add(id); await json(`/api/agents/${encodeURIComponent(id)}/restore`, {method:"POST", body:JSON.stringify({snapshotId})});
       } else {
         const path = action === "rotate" ? "credentials/rotate" : action;
         busy.add(id); await json(`/api/agents/${encodeURIComponent(id)}/${path}`, {method:"POST", body:"{}"});
@@ -159,6 +182,11 @@
       await load();
     } catch (error) { $("list-error").textContent = error.message; }
     finally { busy.delete(id); }
+  });
+
+  $("agents").addEventListener("change", event => {
+    const select = event.target.closest("[data-snapshots]"); if (!select) return;
+    selectedSnapshots.set(select.closest(".agent").dataset.id, select.value);
   });
 
   $("agents").addEventListener("click", async event => {

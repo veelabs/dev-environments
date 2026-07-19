@@ -15,25 +15,31 @@ import (
 )
 
 const (
-	HermesPhaseStorage     = "storage"
-	HermesPhaseBootstrap   = "bootstrap"
-	HermesPhaseCredentials = "credentials"
-	HermesPhaseStarting    = "starting"
-	HermesPhaseWiring      = "wiring"
-	HermesPhaseVerifying   = "verifying"
-	HermesPhaseRunning     = "running"
-	HermesPhaseStopping    = "stopping"
-	HermesPhaseStopped     = "stopped"
-	HermesPhaseRotating    = "rotating-credentials"
-	HermesPhaseBackingUp   = "backing-up"
-	HermesPhaseForgetting  = "forgetting"
-	HermesPhaseError       = "error"
+	HermesPhaseStorage      = "storage"
+	HermesPhaseBootstrap    = "bootstrap"
+	HermesPhaseCredentials  = "credentials"
+	HermesPhaseStarting     = "starting"
+	HermesPhaseWiring       = "wiring"
+	HermesPhaseVerifying    = "verifying"
+	HermesPhaseRunning      = "running"
+	HermesPhaseStopping     = "stopping"
+	HermesPhaseStopped      = "stopped"
+	HermesPhaseRotating     = "rotating-credentials"
+	HermesPhaseBackingUp    = "backing-up"
+	HermesPhaseDeletingData = "deleting-data"
+	HermesPhaseBackupOnly   = "backup-only"
+	HermesPhaseRestoring    = "restoring"
+	HermesPhaseForgetting   = "forgetting"
+	HermesPhaseError        = "error"
 
 	HermesOperationSignal            = "operation"
 	HermesOperationStart             = "start"
 	HermesOperationStop              = "stop"
 	HermesOperationRotateCredentials = "rotate-credentials"
 	HermesOperationBackup            = "backup"
+	HermesOperationDeleteData        = "delete-data"
+	HermesOperationRestore           = "restore"
+	HermesOperationListSnapshots     = "list-snapshots"
 	HermesOperationForget            = "forget"
 )
 
@@ -54,15 +60,25 @@ type HermesInput struct {
 type HermesOperation struct {
 	Type         string `json:"type"`
 	Confirmation string `json:"confirmation,omitempty"`
+	Force        bool   `json:"force,omitempty"`
+	SnapshotID   string `json:"snapshotId,omitempty"`
 }
 
 type HermesStatus struct {
-	Phase        string             `json:"phase"`
-	AgentID      string             `json:"agentId"`
-	DashboardURL string             `json:"dashboardUrl,omitempty"`
-	Image        string             `json:"image,omitempty"`
-	LastError    string             `json:"lastError,omitempty"`
-	Backup       HermesBackupStatus `json:"backup,omitempty"`
+	Phase                  string                      `json:"phase"`
+	AgentID                string                      `json:"agentId"`
+	DashboardURL           string                      `json:"dashboardUrl,omitempty"`
+	Image                  string                      `json:"image,omitempty"`
+	LastError              string                      `json:"lastError,omitempty"`
+	DataPresent            bool                        `json:"dataPresent"`
+	DataStateKnown         bool                        `json:"dataStateKnown,omitempty"`
+	RestoreCleanupPending  bool                        `json:"restoreCleanupPending,omitempty"`
+	RestoreDataConflict    bool                        `json:"restoreDataConflict,omitempty"`
+	RestoreSchedulePending bool                        `json:"restoreSchedulePending,omitempty"`
+	ForceDeleteAllowed     bool                        `json:"forceDeleteAllowed,omitempty"`
+	Snapshots              []activities.HermesSnapshot `json:"snapshots,omitempty"`
+	SnapshotError          string                      `json:"snapshotError,omitempty"`
+	Backup                 HermesBackupStatus          `json:"backup,omitempty"`
 }
 
 type HermesBackupStatus struct {
@@ -166,6 +182,12 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 	}
 	cleanupOnExit := true
 	initialized := in.Initialized
+	dataPresent := initialized
+	if in.State != nil && (in.State.DataStateKnown || in.State.Phase == HermesPhaseBackupOnly) {
+		dataPresent = in.State.DataPresent
+	}
+	status.DataPresent = dataPresent
+	status.DataStateKnown = true
 	bootstrapped := false
 	seedCleanupPending := in.Seed != nil && !initialized
 	defer func() {
@@ -250,6 +272,9 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			return fail("create dashboard credentials", err)
 		}
 		initialized = true
+		dataPresent = true
+		status.DataPresent = true
+		status.DataStateKnown = true
 		return nil
 	}
 
@@ -292,6 +317,71 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			}
 		}
 	}
+	backup := func(previousPhase string) bool {
+		shortCtx, _ := activityContexts(ctx)
+		var resources activities.HermesResources
+		status.Phase = HermesPhaseBackingUp
+		status.Backup.Phase = HermesBackupPhaseBackingUp
+		status.Backup.LastAttemptAt = workflow.Now(ctx).UTC().Format(time.RFC3339)
+		status.Backup.LastError = ""
+		if err := workflow.ExecuteActivity(shortCtx, a.InspectHermesResources, agentID).Get(ctx, &resources); err != nil {
+			status.Backup.Phase = HermesBackupPhaseFailed
+			status.Backup.LastError = "Could not inspect retained agent data. Try again shortly."
+			status.Phase = previousPhase
+			return false
+		}
+		if !resources.PVCPresent {
+			status.Backup.Phase = HermesBackupPhaseFailed
+			status.Backup.LastError = "Backup requires retained agent data."
+			status.Phase = previousPhase
+			return false
+		}
+		backupCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: time.Hour,
+			StartToCloseTimeout:    time.Hour,
+			HeartbeatTimeout:       30 * time.Second,
+			RetryPolicy: &temporal.RetryPolicy{
+				InitialInterval: time.Second, MaximumInterval: 10 * time.Second, MaximumAttempts: 5,
+			},
+		})
+		if err := workflow.ExecuteActivity(shortCtx, a.DeleteHermesBackup, agentID).Get(ctx, nil); err != nil {
+			status.Phase = previousPhase
+			status.Backup.Phase = HermesBackupPhaseFailed
+			status.Backup.LastError = "Could not prepare the backup pod. Try again shortly."
+			return false
+		}
+		var result activities.BackupHermesOutput
+		backupErr := workflow.ExecuteActivity(backupCtx, a.BackupHermes, agentID).Get(ctx, &result)
+		if backupErr == nil {
+			cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
+			cleanupShortCtx, _ := activityContexts(cleanupCtx)
+			if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesBackup, agentID).Get(cleanupCtx, nil); err != nil {
+				workflow.GetLogger(ctx).Error("Hermes backup pod cleanup failed", "agentID", agentID, "error", err)
+			}
+			cancel()
+		}
+		status.Phase = previousPhase
+		if backupErr != nil {
+			status.Backup.Phase = HermesBackupPhaseFailed
+			status.Backup.LastError = "Backup outcome is unknown. Check NAS snapshots before retrying."
+			var applicationErr *temporal.ApplicationError
+			if errors.As(backupErr, &applicationErr) {
+				switch applicationErr.Type() {
+				case "HermesBackupFailed":
+					status.Backup.LastError = "Backup archive validation or NAS upload failed. Verify agent data, NAS reachability, and the backup Secret, then retry."
+				case "HermesBackupMetadataMissing":
+					status.Backup.LastError = "A snapshot was uploaded, but its identity could not be read. Check NAS snapshots before retrying."
+				}
+			}
+			return false
+		}
+		status.Backup.Phase = HermesBackupPhaseSucceeded
+		status.Backup.LastSuccessAt = workflow.Now(ctx).UTC().Format(time.RFC3339)
+		status.Backup.SnapshotID = result.SnapshotID
+		status.Backup.SnapshotTime = result.SnapshotTime
+		status.Backup.LastError = ""
+		return true
+	}
 
 	operationCount := 0
 	operations := workflow.GetSignalChannel(ctx, HermesOperationSignal)
@@ -329,8 +419,18 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			}
 		}
 
+		if status.ForceDeleteAllowed && operation.Type != HermesOperationDeleteData && operation.Type != HermesOperationListSnapshots {
+			status.ForceDeleteAllowed = false
+		}
+
 		switch operation.Type {
 		case HermesOperationStop:
+			if !dataPresent {
+				status.Phase = HermesPhaseBackupOnly
+				status.DashboardURL = ""
+				status.LastError = ""
+				break
+			}
 			if status.Phase != HermesPhaseStopped {
 				status.Phase = HermesPhaseStopping
 				if err := cleanup(ctx); err != nil {
@@ -343,6 +443,14 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 			}
 		case HermesOperationStart:
 			if status.Phase != HermesPhaseRunning {
+				if status.RestoreCleanupPending || status.RestoreDataConflict || status.RestoreSchedulePending {
+					status.LastError = "Resolve restore data before starting this agent."
+					break
+				}
+				if !dataPresent && initialized {
+					status.LastError = "Restore a snapshot before starting this backup-only agent."
+					break
+				}
 				if status.Phase == HermesPhaseError && strings.HasPrefix(status.LastError, HermesPhaseBootstrap+":") {
 					break
 				}
@@ -382,31 +490,32 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 				if err := start(); err != nil {
 					_ = cleanup(ctx)
 				}
+			} else if !dataPresent {
+				status.Phase = HermesPhaseBackupOnly
+				status.LastError = ""
 			} else {
 				status.Phase = HermesPhaseStopped
 				status.LastError = ""
 			}
 		case HermesOperationBackup:
-			previousPhase := status.Phase
-			shortCtx, _ := activityContexts(ctx)
-			var resources activities.HermesResources
-			status.Phase = HermesPhaseBackingUp
-			status.Backup.Phase = HermesBackupPhaseBackingUp
-			status.Backup.LastAttemptAt = workflow.Now(ctx).UTC().Format(time.RFC3339)
-			status.Backup.LastError = ""
-			if err := workflow.ExecuteActivity(shortCtx, a.InspectHermesResources, agentID).Get(ctx, &resources); err != nil {
-				status.Backup.Phase = HermesBackupPhaseFailed
-				status.Backup.LastError = "Could not inspect retained agent data. Try again shortly."
-				status.Phase = previousPhase
+			backup(status.Phase)
+		case HermesOperationListSnapshots:
+			_, waitCtx := activityContexts(ctx)
+			var snapshots []activities.HermesSnapshot
+			if err := workflow.ExecuteActivity(waitCtx, a.ListHermesSnapshots, agentID).Get(ctx, &snapshots); err != nil {
+				status.SnapshotError = "Could not list restore points. Verify NAS reachability and retry."
 				break
 			}
-			if !resources.PVCPresent {
-				status.Backup.Phase = HermesBackupPhaseFailed
-				status.Backup.LastError = "Backup requires retained agent data."
-				status.Phase = previousPhase
+			status.Snapshots = snapshots
+			status.SnapshotError = ""
+		case HermesOperationRestore:
+			if dataPresent && !status.RestoreSchedulePending {
+				status.LastError = "Delete existing persistent data before restoring a snapshot."
 				break
 			}
-			backupCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			status.Phase = HermesPhaseRestoring
+			status.LastError = ""
+			restoreCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 				ScheduleToCloseTimeout: time.Hour,
 				StartToCloseTimeout:    time.Hour,
 				HeartbeatTimeout:       30 * time.Second,
@@ -414,42 +523,124 @@ func ProvisionHermesAgent(ctx workflow.Context, in HermesInput) error {
 					InitialInterval: time.Second, MaximumInterval: 10 * time.Second, MaximumAttempts: 5,
 				},
 			})
-			if err := workflow.ExecuteActivity(shortCtx, a.DeleteHermesBackup, agentID).Get(ctx, nil); err != nil {
-				status.Phase = previousPhase
-				status.Backup.Phase = HermesBackupPhaseFailed
-				status.Backup.LastError = "Could not prepare the backup pod. Try again shortly."
-				break
-			}
-			var result activities.BackupHermesOutput
-			backupErr := workflow.ExecuteActivity(backupCtx, a.BackupHermes, agentID).Get(ctx, &result)
-			if backupErr == nil {
-				cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
-				cleanupShortCtx, _ := activityContexts(cleanupCtx)
-				if err := workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesBackup, agentID).Get(cleanupCtx, nil); err != nil {
-					workflow.GetLogger(ctx).Error("Hermes backup pod cleanup failed", "agentID", agentID, "error", err)
-				}
-				cancel()
-			}
-			status.Phase = previousPhase
-			if backupErr != nil {
-				status.Backup.Phase = HermesBackupPhaseFailed
-				status.Backup.LastError = "Backup outcome is unknown. Check NAS snapshots before retrying."
+			err := workflow.ExecuteActivity(restoreCtx, a.RestoreHermesSnapshot, activities.RestoreHermesSnapshotInput{
+				AgentID: agentID, SnapshotID: operation.SnapshotID,
+			}).Get(ctx, nil)
+			if err != nil {
 				var applicationErr *temporal.ApplicationError
-				if errors.As(backupErr, &applicationErr) {
-					switch applicationErr.Type() {
-					case "HermesBackupFailed":
-						status.Backup.LastError = "Backup archive validation or NAS upload failed. Verify agent data, NAS reachability, and the backup Secret, then retry."
-					case "HermesBackupMetadataMissing":
-						status.Backup.LastError = "A snapshot was uploaded, but its identity could not be read. Check NAS snapshots before retrying."
-					}
+				errors.As(err, &applicationErr)
+				errorType := ""
+				if applicationErr != nil {
+					errorType = applicationErr.Type()
+				}
+				if errorType == "HermesRestoreScheduleFailed" {
+					dataPresent = true
+					status.DataPresent = true
+					status.RestoreCleanupPending = false
+					status.RestoreDataConflict = false
+					status.RestoreSchedulePending = true
+					status.Phase = HermesPhaseError
+					status.LastError = "Restored data is imported but remains stopped until its backup schedule is reconciled. Retry Restore."
+					break
+				}
+				if errorType == "HermesDataPresent" {
+					dataPresent = true
+					status.DataPresent = true
+					status.RestoreDataConflict = true
+					status.RestoreSchedulePending = false
+					status.Phase = HermesPhaseError
+					status.LastError = "Restore found unexpected persistent data. Inspect it or use confirmed Delete data before retrying restore."
+					break
+				}
+				cleanupRequired := errorType == "HermesRestoreIncomplete" || errorType == ""
+				var cleanupErr error
+				if cleanupRequired {
+					cleanupCtx, cancel := workflow.NewDisconnectedContext(ctx)
+					cleanupShortCtx, _ := activityContexts(cleanupCtx)
+					cleanupErr = workflow.ExecuteActivity(cleanupShortCtx, a.DeleteHermesData, agentID).Get(cleanupCtx, nil)
+					cancel()
+				}
+				status.Phase = HermesPhaseError
+				status.DataPresent = false
+				status.RestoreDataConflict = false
+				status.RestoreSchedulePending = false
+				status.LastError = "Restore failed validation or import; no runtime was started. Select a restore point and retry."
+				if cleanupErr != nil {
+					dataPresent = true
+					status.DataPresent = true
+					status.RestoreCleanupPending = true
+					status.LastError = "Restore failed and partial data cleanup is incomplete. Retry data deletion before restoring again."
+				} else if !cleanupRequired {
+					status.LastError = "Restore was rejected before new data was created. Verify the selected snapshot and current resources, then retry."
 				}
 				break
 			}
-			status.Backup.Phase = HermesBackupPhaseSucceeded
-			status.Backup.LastSuccessAt = workflow.Now(ctx).UTC().Format(time.RFC3339)
-			status.Backup.SnapshotID = result.SnapshotID
-			status.Backup.SnapshotTime = result.SnapshotTime
-			status.Backup.LastError = ""
+			dataPresent = true
+			status.DataPresent = true
+			status.RestoreCleanupPending = false
+			status.RestoreDataConflict = false
+			status.RestoreSchedulePending = false
+			if err := start(); err != nil {
+				_ = cleanup(ctx)
+			}
+		case HermesOperationDeleteData:
+			if operation.Confirmation != agentID {
+				status.LastError = "type " + agentID + " to confirm data deletion"
+				break
+			}
+			if !dataPresent {
+				status.Phase = HermesPhaseBackupOnly
+				break
+			}
+			if status.RestoreCleanupPending {
+				status.Phase = HermesPhaseDeletingData
+				shortCtx, _ := activityContexts(ctx)
+				if err := workflow.ExecuteActivity(shortCtx, a.DeleteHermesData, agentID).Get(ctx, nil); err != nil {
+					fail("delete incomplete restore data", err)
+					break
+				}
+				dataPresent = false
+				status.DataPresent = false
+				status.RestoreCleanupPending = false
+				status.RestoreDataConflict = false
+				status.RestoreSchedulePending = false
+				status.Phase = HermesPhaseBackupOnly
+				status.LastError = ""
+				break
+			}
+			if status.Phase != HermesPhaseStopped {
+				status.Phase = HermesPhaseStopping
+				if err := cleanup(ctx); err != nil {
+					fail("stop runtime before deleting data", err)
+					break
+				}
+			}
+			status.Phase = HermesPhaseDeletingData
+			if !operation.Force && !backup(HermesPhaseDeletingData) {
+				status.Phase = HermesPhaseError
+				status.LastError = "Final backup failed, so persistent data was not deleted. Retry or explicitly force deletion."
+				status.ForceDeleteAllowed = true
+				break
+			}
+			if operation.Force && !status.ForceDeleteAllowed {
+				status.Phase = HermesPhaseError
+				status.LastError = "Force deletion is available only after a final backup failure."
+				break
+			}
+			shortCtx, _ := activityContexts(ctx)
+			if err := workflow.ExecuteActivity(shortCtx, a.DeleteHermesData, agentID).Get(ctx, nil); err != nil {
+				fail("delete persistent data", err)
+				break
+			}
+			dataPresent = false
+			status.DataPresent = false
+			status.RestoreCleanupPending = false
+			status.RestoreDataConflict = false
+			status.RestoreSchedulePending = false
+			status.ForceDeleteAllowed = false
+			status.Phase = HermesPhaseBackupOnly
+			status.DashboardURL = ""
+			status.LastError = ""
 		case HermesOperationForget:
 			if operation.Confirmation != agentID {
 				status.LastError = "type " + agentID + " to confirm Forget"

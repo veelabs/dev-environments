@@ -3,6 +3,8 @@ package activities
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
 
 	"github.com/veelabs/dev-environments/provisioner/internal/config"
 	"github.com/veelabs/dev-environments/provisioner/internal/profilebundle"
@@ -30,6 +33,7 @@ const resticTestImage = "docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61
 
 func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.T) {
 	ctx := context.Background()
+	snapshotID := strings.Repeat("a", 64)
 	kube := fake.NewClientset()
 	a := New(config.Config{
 		SandboxNamespace:       "hermes-agents",
@@ -38,7 +42,7 @@ func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.
 		HermesBackupSecret:     "hermes-backup",
 		HermesBackupRepository: "sftp:user@nas:/repo",
 	}, nil, kube)
-	completeHermesBackupJob(t, ctx, kube, "agent-calm-fox", `{"message_type":"summary","snapshot_id":"0123456789abcdef","backup_start":"2026-07-19T10:11:12Z"}`)
+	completeHermesBackupJob(t, ctx, kube, "agent-calm-fox", fmt.Sprintf(`{"message_type":"summary","snapshot_id":%q,"backup_start":"2026-07-19T10:11:12Z"}`, snapshotID))
 	var suite testsuite.WorkflowTestSuite
 	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
 	activityEnv.RegisterActivity(a)
@@ -47,7 +51,11 @@ func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.
 	require.NoError(t, err)
 	var output BackupHermesOutput
 	require.NoError(t, value.Get(&output))
-	require.Equal(t, BackupHermesOutput{SnapshotID: "0123456789abcdef", SnapshotTime: "2026-07-19T10:11:12Z"}, output)
+	require.Equal(t, BackupHermesOutput{SnapshotID: snapshotID, SnapshotTime: "2026-07-19T10:11:12Z"}, output)
+	retried, err := activityEnv.ExecuteActivity(a.BackupHermes, "agent-calm-fox")
+	require.NoError(t, err)
+	require.NoError(t, retried.Get(&output))
+	require.Equal(t, snapshotID, output.SnapshotID)
 
 	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-calm-fox"), metav1.GetOptions{})
 	require.NoError(t, err)
@@ -79,6 +87,245 @@ func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.
 
 	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
 	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
+}
+
+func TestBackupHermesRejectsShortSnapshotIdentity(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, nil, kube)
+	completeHermesBackupJob(t, ctx, kube, "agent-calm-fox", `{"message_type":"summary","snapshot_id":"0123456789abcdef","backup_start":"2026-07-19T10:11:12Z"}`)
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.BackupHermes, "agent-calm-fox")
+	require.ErrorContains(t, err, "snapshot identity is unavailable")
+}
+
+func TestListHermesSnapshotsFiltersAgentIdentityAndSortsNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, nil, kube)
+	oldID := strings.Repeat("a", 64)
+	newID := strings.Repeat("b", 64)
+	a.podLogs = func(_ context.Context, namespace, pod, container string) ([]byte, error) {
+		require.Equal(t, "hermes-agents", namespace)
+		require.Equal(t, hermesSnapshotResourceName("agent-calm-fox"), pod)
+		require.Equal(t, "list", container)
+		return []byte(fmt.Sprintf(`[
+			{"id":%q,"time":"2026-07-18T10:00:00Z","hostname":"agent-calm-fox","tags":["hermes-agent","agent:agent-calm-fox"],"paths":["/backup/hermes.zip"]},
+			{"id":%q,"time":"2026-07-19T10:00:00Z","hostname":"agent-calm-fox","tags":["agent:agent-calm-fox","hermes-agent"],"paths":["/backup/hermes.zip"]},
+			{"id":%q,"time":"2026-07-20T10:00:00Z","hostname":"agent-other-fox","tags":["hermes-agent","agent:agent-calm-fox"],"paths":["/backup/hermes.zip"]},
+			{"id":"short","time":"2026-07-21T10:00:00Z","hostname":"agent-calm-fox","tags":["hermes-agent","agent:agent-calm-fox"],"paths":["/backup/hermes.zip"]}
+		]`, oldID, newID, strings.Repeat("c", 64))), nil
+	}
+	completeHermesJob(t, ctx, kube, hermesSnapshotResourceName("agent-calm-fox"))
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	value, err := activityEnv.ExecuteActivity(a.ListHermesSnapshots, "agent-calm-fox")
+	require.NoError(t, err)
+	var snapshots []HermesSnapshot
+	require.NoError(t, value.Get(&snapshots))
+	require.Equal(t, []HermesSnapshot{
+		{SnapshotID: newID, SnapshotTime: "2026-07-19T10:00:00Z"},
+		{SnapshotID: oldID, SnapshotTime: "2026-07-18T10:00:00Z"},
+	}, snapshots)
+
+	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, hermesSnapshotResourceName("agent-calm-fox"), metav1.GetOptions{})
+	require.NoError(t, err)
+	container := job.Spec.Template.Spec.Containers[0]
+	require.Contains(t, container.Args[0], `--host "$AGENT_ID"`)
+	require.Contains(t, container.Args[0], `--tag "hermes-agent,agent:$AGENT_ID"`)
+	require.Contains(t, container.Args[0], "--path /backup/hermes.zip")
+	require.Contains(t, container.Args[0], ">/work/snapshots.json 2>/work/snapshots.err")
+	require.Contains(t, container.Args[0], "cat /work/snapshots.err >&2")
+	require.Equal(t, "hermes-backup", job.Spec.Template.Spec.Volumes[0].Secret.SecretName)
+}
+
+func TestRestoreHermesSnapshotImportsValidatedArchiveBeforeScheduling(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	snapshotID := strings.Repeat("a", 64)
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:           "hermes-agents",
+		HermesStorageClass:         "local-path",
+		HermesImage:                hermesTestImage,
+		HermesResticImage:          resticTestImage,
+		HermesBackupSecret:         "hermes-backup",
+		HermesBackupRepository:     "sftp:user@nas:/repo",
+		HermesBackupStaggerMinutes: 180,
+	}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+	a.podLogs = func(context.Context, string, string, string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`[{"id":%q,"time":"2026-07-19T10:00:00Z","hostname":%q,"tags":["hermes-agent",%q],"paths":["/backup/hermes.zip"]}]`, snapshotID, agentID, "agent:"+agentID)), nil
+	}
+	completeHermesJob(t, ctx, kube, hermesSnapshotResourceName(agentID))
+	completeHermesJob(t, ctx, kube, hermesRestoreResourceName(agentID))
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(5 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.RestoreHermesSnapshot, RestoreHermesSnapshotInput{
+		AgentID: agentID, SnapshotID: snapshotID,
+	})
+	require.NoError(t, err)
+	_, err = activityEnv.ExecuteActivity(a.RestoreHermesSnapshot, RestoreHermesSnapshotInput{
+		AgentID: agentID, SnapshotID: snapshotID,
+	})
+	require.NoError(t, err)
+
+	pvc, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "5Gi", pvc.Spec.Resources.Requests.Storage().String())
+	require.Equal(t, snapshotID, pvc.Annotations[hermesRestoreCompleteAnnotation])
+	require.Empty(t, pvc.Annotations[hermesRestorePendingAnnotation])
+	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName(agentID), metav1.GetOptions{})
+	require.NoError(t, err)
+
+	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, hermesRestoreResourceName(agentID), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, snapshotID, job.Annotations[hermesRestorePendingAnnotation])
+	require.Len(t, job.Spec.Template.Spec.InitContainers, 1)
+	restic := job.Spec.Template.Spec.InitContainers[0]
+	require.Contains(t, restic.Args[0], `restore "$SNAPSHOT_ID"`)
+	require.Contains(t, restic.Args[0], "--include /backup/hermes.zip")
+	require.Contains(t, restic.VolumeMounts, corev1.VolumeMount{Name: "secret", MountPath: "/secret", ReadOnly: true})
+	require.Len(t, job.Spec.Template.Spec.Containers, 1)
+	importer := job.Spec.Template.Spec.Containers[0]
+	require.Contains(t, importer.Args[0], `"/opt/hermes/.venv/bin/hermes", "import"`)
+	for _, mount := range importer.VolumeMounts {
+		require.NotEqual(t, "secret", mount.Name)
+	}
+}
+
+func TestRestoreHermesSnapshotRejectsWrongAgentBeforeCreatingPVC(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	requestedID := strings.Repeat("a", 64)
+	otherID := strings.Repeat("b", 64)
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+	a.podLogs = func(context.Context, string, string, string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`[{"id":%q,"time":"2026-07-19T10:00:00Z","hostname":%q,"tags":["hermes-agent",%q],"paths":["/backup/hermes.zip"]}]`, otherID, agentID, "agent:"+agentID)), nil
+	}
+	completeHermesJob(t, ctx, kube, hermesSnapshotResourceName(agentID))
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.RestoreHermesSnapshot, RestoreHermesSnapshotInput{
+		AgentID: agentID, SnapshotID: requestedID,
+	})
+	require.ErrorContains(t, err, "snapshot does not belong")
+	_, err = kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	_, err = kube.BatchV1().Jobs("hermes-agents").Get(ctx, hermesRestoreResourceName(agentID), metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+}
+
+func TestRestoreHermesSnapshotReportsFailedImportAsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	snapshotID := strings.Repeat("a", 64)
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesStorageClass:     "local-path",
+		HermesImage:            hermesTestImage,
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+	a.podLogs = func(context.Context, string, string, string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`[{"id":%q,"time":"2026-07-19T10:00:00Z","hostname":%q,"tags":["hermes-agent",%q],"paths":["/backup/hermes.zip"]}]`, snapshotID, agentID, "agent:"+agentID)), nil
+	}
+	completeHermesJob(t, ctx, kube, hermesSnapshotResourceName(agentID))
+	failHermesJob(t, ctx, kube, hermesRestoreResourceName(agentID))
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(5 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.RestoreHermesSnapshot, RestoreHermesSnapshotInput{
+		AgentID: agentID, SnapshotID: snapshotID,
+	})
+	require.ErrorContains(t, err, "Hermes restore is incomplete")
+	pvc, getErr := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	require.Equal(t, snapshotID, pvc.Annotations[hermesRestorePendingAnnotation])
+	_, getErr = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName(agentID), metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(getErr))
+}
+
+func TestRestoreHermesSnapshotRecoversUnknownPVCCreateOutcome(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	snapshotID := strings.Repeat("a", 64)
+	kube := fake.NewClientset()
+	kube.Fake.PrependReactor("create", "persistentvolumeclaims", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		created := action.(kubetesting.CreateAction).GetObject().DeepCopyObject()
+		err := kube.Tracker().Create(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), created, "hermes-agents")
+		require.NoError(t, err)
+		return true, nil, errors.New("PVC create response lost")
+	})
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesStorageClass:     "local-path",
+		HermesImage:            hermesTestImage,
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+	a.podLogs = func(context.Context, string, string, string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`[{"id":%q,"time":"2026-07-19T10:00:00Z","hostname":%q,"tags":["hermes-agent",%q],"paths":["/backup/hermes.zip"]}]`, snapshotID, agentID, "agent:"+agentID)), nil
+	}
+	completeHermesJob(t, ctx, kube, hermesSnapshotResourceName(agentID))
+	completeHermesJob(t, ctx, kube, hermesRestoreResourceName(agentID))
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(5 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	_, err := activityEnv.ExecuteActivity(a.RestoreHermesSnapshot, RestoreHermesSnapshotInput{
+		AgentID: agentID, SnapshotID: snapshotID,
+	})
+	require.NoError(t, err)
+	pvc, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, snapshotID, pvc.Annotations[hermesRestoreCompleteAnnotation])
+}
+
+func TestPendingHermesRestoreHasNoBackupSchedule(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	name := HermesBackupResourceName(agentID)
+	kube := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: agentID, Namespace: "hermes-agents", Labels: hermesLabels(agentID),
+			Annotations: map[string]string{hermesRestorePendingAnnotation: strings.Repeat("a", 64)},
+		}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "hermes-agents"}},
+	)
+	a := New(config.Config{SandboxNamespace: "hermes-agents"}, nil, kube)
+
+	require.NoError(t, a.ReconcileHermesBackupSchedule(ctx, agentID))
+	_, err := kube.BatchV1().CronJobs("hermes-agents").Get(ctx, name, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
 }
 
 func TestHermesBackupScheduleFollowsRetainedPVCAndReusesBackupJob(t *testing.T) {
@@ -121,6 +368,58 @@ func TestHermesBackupScheduleFollowsRetainedPVCAndReusesBackupJob(t *testing.T) 
 	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-calm-fox"), metav1.GetOptions{})
 	require.True(t, apierrors.IsNotFound(err))
 	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-bold-yak"), metav1.GetOptions{})
+	require.NoError(t, err)
+}
+
+func TestDeleteHermesDataRemovesPVCAndBackupWorkButRetainsCredentials(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	backupName := HermesBackupResourceName(agentID)
+	kube := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: agentID, Namespace: "hermes-agents"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentID, Namespace: "hermes-agents"}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: "hermes-agents"}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: "hermes-agents", Labels: hermesLabels(agentID)}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "scheduled-backup", Namespace: "hermes-agents", Labels: hermesLabels(agentID)}},
+	)
+	a := New(config.Config{SandboxNamespace: "hermes-agents"}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+
+	require.NoError(t, a.DeleteHermesData(ctx, agentID))
+	require.NoError(t, a.DeleteHermesData(ctx, agentID))
+
+	_, err := kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, backupName, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	jobs, err := kube.BatchV1().Jobs("hermes-agents").List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, jobs.Items)
+	_, err = kube.CoreV1().Secrets("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.NoError(t, err)
+}
+
+func TestDeleteHermesDataRestoresScheduleWhenPVCDeletionFails(t *testing.T) {
+	ctx := context.Background()
+	agentID := "agent-calm-fox"
+	backupName := HermesBackupResourceName(agentID)
+	kube := fake.NewClientset(
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: agentID, Namespace: "hermes-agents", Labels: hermesLabels(agentID), UID: "pvc-uid",
+		}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: "hermes-agents"}},
+	)
+	kube.Fake.PrependReactor("delete", "persistentvolumeclaims", func(kubetesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("storage API unavailable")
+	})
+	a := New(config.Config{
+		SandboxNamespace: "hermes-agents", HermesBackupStaggerMinutes: 180,
+	}, dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), kube)
+
+	err := a.DeleteHermesData(ctx, agentID)
+	require.ErrorContains(t, err, "storage API unavailable")
+	_, err = kube.CoreV1().PersistentVolumeClaims("hermes-agents").Get(ctx, agentID, metav1.GetOptions{})
+	require.NoError(t, err)
+	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, backupName, metav1.GetOptions{})
 	require.NoError(t, err)
 }
 
@@ -192,8 +491,11 @@ func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	require.Equal(t, "2Gi", nestedString(t, container, "resources", "requests", "memory"))
 	require.Equal(t, "2", nestedString(t, container, "resources", "limits", "cpu"))
 	require.Equal(t, "4Gi", nestedString(t, container, "resources", "limits", "memory"))
-	require.Equal(t, "/api/status", nestedString(t, container, "readinessProbe", "httpGet", "path"))
-	require.Equal(t, int64(9119), nestedInt(t, container, "readinessProbe", "httpGet", "port"))
+	probeCommand := nestedSlice(t, container, "readinessProbe", "exec", "command")
+	require.Equal(t, []any{"/opt/hermes/.venv/bin/python", "-c", hermesReadinessScript}, probeCommand)
+	require.Contains(t, hermesReadinessScript, "http://127.0.0.1:9119/api/status")
+	require.Contains(t, hermesReadinessScript, "http://127.0.0.1:8642/health")
+	require.Contains(t, hermesReadinessScript, `api["platform"] != "hermes-agent"`)
 
 	volumes := nestedSlice(t, sandbox.Object, "spec", "podTemplate", "spec", "volumes")
 	require.Len(t, volumes, 2)
@@ -479,6 +781,48 @@ func completeHermesBackupJob(t *testing.T, ctx context.Context, kube *fake.Clien
 	}()
 }
 
+func completeHermesJob(t *testing.T, ctx context.Context, kube *fake.Clientset, name string) {
+	t.Helper()
+	go func() {
+		for {
+			job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			require.NoError(t, err)
+			_, err = kube.CoreV1().Pods("hermes-agents").Create(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "hermes-agents", Labels: map[string]string{batchv1.JobNameLabel: name}},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			_, err = kube.BatchV1().Jobs("hermes-agents").UpdateStatus(ctx, job, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			return
+		}
+	}()
+}
+
+func failHermesJob(t *testing.T, ctx context.Context, kube *fake.Clientset, name string) {
+	t.Helper()
+	go func() {
+		for {
+			job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			require.NoError(t, err)
+			job.Status.Conditions = []batchv1.JobCondition{{
+				Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "ImportFailed",
+			}}
+			_, err = kube.BatchV1().Jobs("hermes-agents").UpdateStatus(ctx, job, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			return
+		}
+	}()
+}
+
 func TestAwaitHermesReadyReportsTerminalSandboxFailure(t *testing.T) {
 	ctx := context.Background()
 	dyn := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
@@ -525,14 +869,6 @@ func nestedString(t *testing.T, object map[string]any, fields ...string) string 
 func nestedBool(t *testing.T, object map[string]any, fields ...string) bool {
 	t.Helper()
 	value, found, err := unstructured.NestedBool(object, fields...)
-	require.NoError(t, err)
-	require.True(t, found, "missing %v", fields)
-	return value
-}
-
-func nestedInt(t *testing.T, object map[string]any, fields ...string) int64 {
-	t.Helper()
-	value, found, err := unstructured.NestedInt64(object, fields...)
 	require.NoError(t, err)
 	require.True(t, found, "missing %v", fields)
 	return value

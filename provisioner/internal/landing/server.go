@@ -117,6 +117,9 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /api/agents/{id}/start", s.handleHermesOperation(wf.HermesOperationStart))
 		mux.HandleFunc("POST /api/agents/{id}/stop", s.handleHermesOperation(wf.HermesOperationStop))
 		mux.HandleFunc("POST /api/agents/{id}/backup", s.handleHermesOperation(wf.HermesOperationBackup))
+		mux.HandleFunc("POST /api/agents/{id}/snapshots/refresh", s.handleHermesOperation(wf.HermesOperationListSnapshots))
+		mux.HandleFunc("POST /api/agents/{id}/data/delete", s.handleHermesDeleteData)
+		mux.HandleFunc("POST /api/agents/{id}/restore", s.handleHermesRestore)
 		mux.HandleFunc("POST /api/agents/{id}/credentials/rotate", s.handleHermesOperation(wf.HermesOperationRotateCredentials))
 		mux.HandleFunc("GET /api/agents/{id}/credentials", s.handleHermesCredentials)
 		mux.HandleFunc("POST /api/agents/{id}/forget", s.handleHermesForget)
@@ -319,6 +322,36 @@ func (s *Server) handleHermesForget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.signalHermesOperation(w, r, wf.HermesOperation{Type: wf.HermesOperationForget, Confirmation: input.Confirmation})
+}
+
+func (s *Server) handleHermesDeleteData(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var input struct {
+		Confirmation string `json:"confirmation"`
+		Force        bool   `json:"force"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil || input.Confirmation != id {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirmation", "message": "Type the full agent ID to confirm data deletion."})
+		return
+	}
+	s.signalHermesOperation(w, r, wf.HermesOperation{
+		Type: wf.HermesOperationDeleteData, Confirmation: input.Confirmation, Force: input.Force,
+	})
+}
+
+func (s *Server) handleHermesRestore(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		SnapshotID string `json:"snapshotId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil || !validSnapshotID(input.SnapshotID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid-snapshot", "message": "Select a valid full snapshot identity."})
+		return
+	}
+	s.signalHermesOperation(w, r, wf.HermesOperation{Type: wf.HermesOperationRestore, SnapshotID: input.SnapshotID})
+}
+
+func validSnapshotID(id string) bool {
+	return activities.ValidHermesSnapshotID(id)
 }
 
 func (s *Server) signalHermesOperation(w http.ResponseWriter, r *http.Request, operation wf.HermesOperation) {

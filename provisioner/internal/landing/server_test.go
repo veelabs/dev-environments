@@ -536,6 +536,34 @@ func TestHermesLifecycleRequestsSignalTheEntity(t *testing.T) {
 	}, f.signals)
 }
 
+func TestHermesRecoveryRequestsRequireSafeConfirmationAndSnapshotIdentity(t *testing.T) {
+	f := &fakeTemporal{}
+	h := newHermesTestServer(f).Handler()
+	snapshotID := strings.Repeat("a", 64)
+
+	rec, _ := doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/snapshots/refresh", `{}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	rec, body := doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/data/delete", `{"confirmation":"wrong"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "confirmation", body["error"])
+	rec, _ = doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/data/delete", `{"confirmation":"agent-calm-fox"}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	rec, _ = doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/data/delete", `{"confirmation":"agent-calm-fox","force":true}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	rec, body = doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/restore", `{"snapshotId":"short"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "invalid-snapshot", body["error"])
+	rec, _ = doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/restore", `{"snapshotId":"`+snapshotID+`"}`)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	require.Equal(t, []fakeSignal{
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationListSnapshots}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationDeleteData, Confirmation: "agent-calm-fox"}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationDeleteData, Confirmation: "agent-calm-fox", Force: true}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationRestore, SnapshotID: snapshotID}},
+	}, f.signals)
+}
+
 func TestHermesCredentialsAreRevealedWithoutCaching(t *testing.T) {
 	s := newHermesTestServer(&fakeTemporal{})
 	s.credentials = fakeCredentialStore{credentials: DashboardCredentials{
@@ -689,6 +717,12 @@ func TestServesDedicatedHermesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "Backup now")
 	require.Contains(t, rec.Body.String(), "last scheduled attempt")
 	require.Contains(t, rec.Body.String(), "next scheduled run")
+	require.Contains(t, rec.Body.String(), "Refresh restore points")
+	require.Contains(t, rec.Body.String(), "Restore selected snapshot")
+	require.Contains(t, rec.Body.String(), "Force delete data")
+	require.Contains(t, rec.Body.String(), "snapshots/refresh")
+	require.Contains(t, rec.Body.String(), "data/delete")
+	require.Contains(t, rec.Body.String(), "selectedSnapshots")
 	require.NotContains(t, rec.Body.String(), `\n+`)
 	require.NotContains(t, rec.Body.String(), "provider key")
 }

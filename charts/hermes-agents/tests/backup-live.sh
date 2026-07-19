@@ -10,16 +10,17 @@ restored="${run_id}-restored"
 archive="${run_id}-archive"
 repository="${run_id}-repository"
 recovery="${run_id}-recovery"
+corrupt_recovery="${run_id}-corrupt-recovery"
 writer="${run_id}-writer"
 tmp="$(mktemp -d)"
 cleanup() {
   docker rm -f "$writer" >/dev/null 2>&1 || true
-  docker volume rm "$fixture" "$restored" "$archive" "$repository" "$recovery" >/dev/null 2>&1 || true
+  docker volume rm "$fixture" "$restored" "$archive" "$repository" "$recovery" "$corrupt_recovery" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
 
-for volume in "$fixture" "$restored" "$archive" "$repository" "$recovery"; do
+for volume in "$fixture" "$restored" "$archive" "$repository" "$recovery" "$corrupt_recovery"; do
   docker volume create "$volume" >/dev/null
 done
 
@@ -125,21 +126,23 @@ docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
   -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo prune
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
   -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json >"$tmp/retained.json"
-python3 - "$tmp/retained.json" <<'PY'
+python3 - "$tmp/retained.json" "$tmp/snapshot-id" <<'PY'
 import collections, json, pathlib, sys
 snapshots = json.loads(pathlib.Path(sys.argv[1]).read_text())
 by_host = collections.Counter(snapshot["hostname"] for snapshot in snapshots)
 assert by_host == {"agent-live-fixture": 1, "agent-live-second": 1, "homelab-data": 1}
 data = next(snapshot for snapshot in snapshots if snapshot["hostname"] == "homelab-data")
 assert "scheduled" in data["tags"] and "hermes-agent" not in data["tags"]
+fixture = next(snapshot for snapshot in snapshots if snapshot["hostname"] == "agent-live-fixture")
+pathlib.Path(sys.argv[2]).write_text(fixture["id"])
 PY
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
   -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo check
 
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
   -v "$repository:/repo" -v "$recovery:/restore" "$RESTIC_IMAGE" \
-  --repo /repo restore latest --target /restore --host agent-live-fixture \
-  --tag hermes-agent --tag agent:agent-live-fixture
+  --repo /repo restore "$(<"$tmp/snapshot-id")" --target /restore \
+  --include /backup/hermes.zip
 
 docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes \
   -v "$restored:/opt/data" -v "$recovery:/restore:ro" "$HERMES_IMAGE" \
@@ -156,3 +159,43 @@ assert db.execute("SELECT value FROM events ORDER BY id LIMIT 1").fetchone()[0] 
 assert db.execute("SELECT count(*) FROM events WHERE value LIKE '"'"'live-%'"'"'").fetchone()[0] >= 1
 db.close()
 '
+
+# A corrupt archive cannot be imported, and attempting recovery never mutates
+# the source restic snapshot.
+docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
+  -v "$archive:/backup" "$HERMES_IMAGE" -c '
+import pathlib
+pathlib.Path("/backup/hermes.zip").write_bytes(b"not a ZIP archive")
+'
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" -v "$archive:/backup:ro" "$RESTIC_IMAGE" \
+  --repo /repo backup --host agent-corrupt-fixture --tag hermes-agent \
+  --tag agent:agent-corrupt-fixture /backup/hermes.zip
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json \
+  --host agent-corrupt-fixture --tag 'hermes-agent,agent:agent-corrupt-fixture' \
+  --path /backup/hermes.zip >"$tmp/corrupt.json"
+python3 - "$tmp/corrupt.json" "$tmp/corrupt-id" <<'PY'
+import json, pathlib, sys
+snapshots = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert len(snapshots) == 1
+pathlib.Path(sys.argv[2]).write_text(snapshots[0]["id"])
+PY
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" -v "$corrupt_recovery:/restore" "$RESTIC_IMAGE" \
+  --repo /repo restore "$(<"$tmp/corrupt-id")" --target /restore \
+  --include /backup/hermes.zip
+if docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes \
+  -v "$restored:/opt/data" -v "$corrupt_recovery:/restore:ro" "$HERMES_IMAGE" \
+  import /restore/backup/hermes.zip --force; then
+  echo "corrupt Hermes archive imported successfully" >&2
+  exit 1
+fi
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json >"$tmp/after-corrupt.json"
+python3 - "$tmp/after-corrupt.json" "$tmp/corrupt-id" <<'PY'
+import json, pathlib, sys
+snapshots = json.loads(pathlib.Path(sys.argv[1]).read_text())
+snapshot_id = pathlib.Path(sys.argv[2]).read_text()
+assert any(snapshot["id"] == snapshot_id for snapshot in snapshots)
+PY
