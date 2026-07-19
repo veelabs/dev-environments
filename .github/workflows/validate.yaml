@@ -53,7 +53,7 @@ jobs:
           docker build -t landing-smoke -f images/landing/Dockerfile .
           test "$(docker inspect --format '{{.Config.User}}' landing-smoke)" = nonroot
           docker run -d --name landing-smoke -p 8642:8642 \
-            -e LANDING_KIND=router -e TAILNET_CIDR=127.0.0.0/8 landing-smoke
+            -e LANDING_KIND=router -e TAILNET_CIDR=0.0.0.0/0 landing-smoke
 
           docker build -t worker-smoke -f images/provisioner/Dockerfile .
           test "$(docker inspect --format '{{.Config.User}}' worker-smoke)" = nonroot
