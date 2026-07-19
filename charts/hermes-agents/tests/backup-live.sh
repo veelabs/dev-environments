@@ -108,7 +108,7 @@ docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes \
   -v "$restored:/opt/data" -v "$recovery:/restore:ro" "$HERMES_IMAGE" \
   import /restore/backup/hermes.zip --force
 docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
-  -v "$restored:/opt/data:ro" "$HERMES_IMAGE" -c '
+  -v "$restored:/opt/data" "$HERMES_IMAGE" -c '
 import pathlib, sqlite3
 home = pathlib.Path("/opt/data")
 assert home.joinpath("SOUL.md").read_text(encoding="utf-8") == "# Live backup fixture\n"
