@@ -43,6 +43,10 @@ spec:
               value: {{ .Values.backup.secretName | quote }}
             - name: HERMES_BACKUP_REPOSITORY
               value: {{ required "backup.repository is required" .Values.backup.repository | quote }}
+            - name: HERMES_BACKUP_HOUR_UTC
+              value: {{ .Values.backup.scheduleHourUTC | quote }}
+            - name: HERMES_BACKUP_STAGGER_MINUTES
+              value: {{ .Values.backup.staggerMinutes | quote }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           securityContext:

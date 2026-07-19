@@ -99,6 +99,43 @@ assert len(snapshots) == 1
 assert snapshots[0]["hostname"] == "agent-live-fixture"
 assert {"hermes-agent", "agent:agent-live-fixture"} <= set(snapshots[0]["tags"])
 PY
+
+# Retention selects only Hermes snapshots and groups them by stable agent host.
+# A data-tier snapshot in the same repository must remain untouched.
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" -v "$archive:/backup:ro" "$RESTIC_IMAGE" \
+  --repo /repo backup --host agent-live-fixture --tag hermes-agent \
+  --tag agent:agent-live-fixture /backup/hermes.zip
+for _ in 1 2; do
+  docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+    -v "$repository:/repo" -v "$archive:/backup:ro" "$RESTIC_IMAGE" \
+    --repo /repo backup --host agent-live-second --tag hermes-agent \
+    --tag agent:agent-live-second /backup/hermes.zip
+done
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" -v "$archive:/backup:ro" "$RESTIC_IMAGE" \
+  --repo /repo backup --host homelab-data --tag scheduled /backup/hermes.zip
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo forget \
+  --tag hermes-agent --group-by host --keep-daily 7 --keep-weekly 4 --keep-monthly 6
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo forget \
+  --tag hermes-agent --group-by host --keep-last 1
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo prune
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json >"$tmp/retained.json"
+python3 - "$tmp/retained.json" <<'PY'
+import collections, json, pathlib, sys
+snapshots = json.loads(pathlib.Path(sys.argv[1]).read_text())
+by_host = collections.Counter(snapshot["hostname"] for snapshot in snapshots)
+assert by_host == {"agent-live-fixture": 1, "agent-live-second": 1, "homelab-data": 1}
+data = next(snapshot for snapshot in snapshots if snapshot["hostname"] == "homelab-data")
+assert "scheduled" in data["tags"] and "hermes-agent" not in data["tags"]
+PY
+docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo check
+
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
   -v "$repository:/repo" -v "$recovery:/restore" "$RESTIC_IMAGE" \
   --repo /repo restore latest --target /restore --host agent-live-fixture \

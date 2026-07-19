@@ -79,6 +79,18 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}
+        {{- if .Values.monitoring.enabled }}
+        - name: monitoring-api-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command: ["sh", "-ceu"]
+          args:
+            - >-
+              kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null &&
+              kubectl get --raw /apis/monitoring.coreos.com/v1 >/dev/null
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        {{- end }}
         - name: ingress-class-check
           image: {{ .Values.preflight.kubectlImage }}
           command: ["kubectl"]

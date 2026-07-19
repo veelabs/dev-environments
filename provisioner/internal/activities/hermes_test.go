@@ -49,7 +49,7 @@ func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.
 	require.NoError(t, value.Get(&output))
 	require.Equal(t, BackupHermesOutput{SnapshotID: "0123456789abcdef", SnapshotTime: "2026-07-19T10:11:12Z"}, output)
 
-	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, hermesBackupJobName("agent-calm-fox"), metav1.GetOptions{})
+	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-calm-fox"), metav1.GetOptions{})
 	require.NoError(t, err)
 	require.False(t, *job.Spec.Template.Spec.AutomountServiceAccountToken)
 	require.Len(t, job.Spec.Template.Spec.InitContainers, 1)
@@ -79,6 +79,49 @@ func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.
 
 	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
 	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
+}
+
+func TestHermesBackupScheduleFollowsRetainedPVCAndReusesBackupJob(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:           "hermes-agents",
+		HermesImage:                hermesTestImage,
+		HermesResticImage:          resticTestImage,
+		HermesBackupSecret:         "hermes-backup",
+		HermesBackupRepository:     "sftp:user@nas:/repo",
+		HermesBackupHourUTC:        0,
+		HermesBackupStaggerMinutes: 180,
+	}, nil, kube)
+
+	_, err := a.CreateHermesPVC(ctx, CreateHermesPVCInput{AgentID: "agent-calm-fox"})
+	require.NoError(t, err)
+	require.NoError(t, a.CreateHermesCredentials(ctx, CreateHermesCredentialsInput{AgentID: "agent-calm-fox"}))
+	_, err = a.CreateHermesPVC(ctx, CreateHermesPVCInput{AgentID: "agent-bold-yak"})
+	require.NoError(t, err)
+	require.NoError(t, a.CreateHermesCredentials(ctx, CreateHermesCredentialsInput{AgentID: "agent-bold-yak"}))
+	calm, err := kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-calm-fox"), metav1.GetOptions{})
+	require.NoError(t, err)
+	bold, err := kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-bold-yak"), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, calm.Spec.Schedule, bold.Spec.Schedule)
+	require.Equal(t, batchv1.ForbidConcurrent, calm.Spec.ConcurrencyPolicy)
+	require.Equal(t, int64(1800), *calm.Spec.StartingDeadlineSeconds)
+	require.Equal(t, "UTC", *calm.Spec.TimeZone)
+	require.Equal(t, "agent-calm-fox", calm.OwnerReferences[0].Name)
+	require.Equal(t, "true", calm.Spec.JobTemplate.Labels[hermesScheduledBackupLabel])
+	require.Equal(t, hermesTestImage, calm.Spec.JobTemplate.Spec.Template.Spec.InitContainers[0].Image)
+	require.Contains(t, calm.Spec.JobTemplate.Spec.Template.Spec.InitContainers[0].Args[0], `"/opt/hermes/.venv/bin/hermes", "backup"`)
+	require.Equal(t, resticTestImage, calm.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Image)
+	require.Contains(t, calm.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Args[0], "--tag hermes-agent")
+	require.True(t, calm.Spec.JobTemplate.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ReadOnly)
+
+	require.NoError(t, kube.CoreV1().PersistentVolumeClaims("hermes-agents").Delete(ctx, "agent-calm-fox", metav1.DeleteOptions{}))
+	require.NoError(t, a.ReconcileHermesBackupSchedules(ctx))
+	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-calm-fox"), metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	_, err = kube.BatchV1().CronJobs("hermes-agents").Get(ctx, HermesBackupResourceName("agent-bold-yak"), metav1.GetOptions{})
+	require.NoError(t, err)
 }
 
 func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
@@ -413,7 +456,7 @@ func completeHermesBootstrapJob(t *testing.T, ctx context.Context, kube *fake.Cl
 func completeHermesBackupJob(t *testing.T, ctx context.Context, kube *fake.Clientset, agentID, message string) {
 	t.Helper()
 	go func() {
-		name := hermesBackupJobName(agentID)
+		name := HermesBackupResourceName(agentID)
 		for {
 			job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, name, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) {

@@ -153,6 +153,48 @@ No LLM keys are injected. Each user authenticates inside their environment
 (OpenChamber terminal → `opencode auth login`). Credentials live in the pod's
 ephemeral filesystem and die with the TTL — by design.
 
+## Hermes backup operations
+
+Every Hermes agent with a retained PVC has a daily
+`hermes-backup-<hash>` CronJob. Stopping runtime keeps that schedule;
+removing the PVC removes it. The chart spreads agents through the configured UTC
+window and uses `concurrencyPolicy: Forbid`, so one agent cannot overlap itself.
+The landing page reports the last scheduled attempt, success, failure, and next
+run. The recovery-point objective is one daily interval: up to 24 hours of
+agent changes can be lost with the PVC.
+
+Inspect or exercise one schedule without changing the workflow:
+
+```sh
+agent=agent-calm-fox
+cronjob=$(kubectl -n hermes-agents get cronjob \
+  -l "renala.dev/agent-id=$agent,renala.dev/hermes-scheduled-backup=true" \
+  -o jsonpath='{.items[0].metadata.name}')
+job="$cronjob-verify-$(date +%s)"
+kubectl -n hermes-agents create job "$job" --from="cronjob/$cronjob"
+kubectl -n hermes-agents wait "job/$job" --for=condition=complete --timeout=70m
+kubectl -n hermes-agents get "job/$job" -o wide
+```
+
+Snapshots use host `<agent-id>` and tags `hermes-agent` and
+`agent:<agent-id>`. The maintenance CronJob selects only `hermes-agent`, groups
+retention by host, keeps 7 daily / 4 weekly / 6 monthly snapshots per agent,
+then prunes and checks. It retries repository lock contention and never runs
+`restic unlock` automatically. Before manual unlock, verify the data-tier
+backup service and every Hermes backup/maintenance Job are inactive; unlocking
+an active writer can corrupt repository operations.
+
+`HermesBackupJobFailed` alerts on failed manual or scheduled Jobs.
+`HermesBackupStale` alerts after 26 hours without success, including schedules
+that have never succeeded. Monitoring is disabled only by explicitly setting
+`monitoring.enabled=false`; when enabled, preflight requires the
+`monitoring.coreos.com/v1` API.
+
+The Hermes and data-tier clients share one repository password and NAS
+write/delete identity. Host and tag filters prevent accidental cross-retention,
+not malicious access. A compromised client can read or delete every recovery
+point in the repository.
+
 ## One-time edge setup (DR checklist)
 
 1. Tunnel public hostname `*.renala.dev` → `http://traefik.kube-system:80`.

@@ -4,27 +4,44 @@ set -euo pipefail
 chart="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
 rendered_custom="$(mktemp)"
-trap 'rm -f "$rendered" "$rendered_custom"' EXIT
+rendered_no_monitoring="$(mktemp)"
+trap 'rm -f "$rendered" "$rendered_custom" "$rendered_no_monitoring"' EXIT
 
 helm lint "$chart" --set-string baseDomain=example.test \
   --set-string router.hostname=homelab-server.example.ts.net \
-  --set-string backup.repository=sftp:user@nas:/repo
-helm template hermes-agents "$chart" --namespace hermes-agents \
-	--set-string baseDomain=example.test \
-	--set-string router.hostname=homelab-server.example.ts.net \
-	--set-string backup.repository=sftp:user@nas:/repo >"$rendered"
+  --set-string backup.repository=sftp:user@nas:/repo \
+  --set-string backup.maintenance.schedule='30 6 * * *'
 helm template hermes-agents "$chart" --namespace hermes-agents \
 	--set-string baseDomain=example.test \
 	--set-string router.hostname=homelab-server.example.ts.net \
 	--set-string backup.repository=sftp:user@nas:/repo \
+	--set-string backup.maintenance.schedule='30 6 * * *' >"$rendered"
+helm template hermes-agents "$chart" --namespace hermes-agents \
+	--set-string baseDomain=example.test \
+	--set-string router.hostname=homelab-server.example.ts.net \
+	--set-string backup.repository=sftp:user@nas:/repo \
+	--set-string backup.maintenance.schedule='30 6 * * *' \
 	--set-string 'hermes.gitAllowedHosts[0]=github.com' \
 	--set-string 'hermes.gitAllowedHosts[1]=gitlab.com' >"$rendered_custom"
+helm template hermes-agents "$chart" --namespace hermes-agents \
+	--set-string baseDomain=example.test \
+	--set-string router.hostname=homelab-server.example.ts.net \
+	--set-string backup.repository=sftp:user@nas:/repo \
+	--set-string backup.maintenance.schedule='30 6 * * *' \
+	--set monitoring.enabled=false >"$rendered_no_monitoring"
 
 assert_rendered() {
   grep -Fq "$1" "${2:-$rendered}" || {
     echo "missing rendered contract: $1" >&2
     return 1
   }
+}
+
+assert_not_rendered() {
+  if grep -Fq "$1" "${2:-$rendered}"; then
+    echo "unexpected rendered contract: $1" >&2
+    return 1
+  fi
 }
 
 assert_rendered 'value: hermes'
@@ -43,8 +60,8 @@ assert_rendered 'name: hermes-landing'
 assert_rendered 'value: "hermes"'
 assert_rendered 'host: "agents.example.test"'
 assert_rendered 'path: /healthz'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.7.0'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.8.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.8.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.9.0'
 assert_rendered 'verbs: ["get", "list"]'
 assert_rendered 'verbs: ["get", "list", "watch", "create", "delete", "update"]'
 assert_rendered 'name: hermes-api-router'
@@ -73,3 +90,27 @@ assert_rendered 'name: HERMES_BACKUP_REPOSITORY'
 assert_rendered 'value: "sftp:user@nas:/repo"'
 assert_rendered 'test -s /secret/RESTIC_PASSWORD && test -s /secret/ssh-privatekey'
 assert_rendered 'secretName: "hermes-backup"'
+assert_rendered 'name: HERMES_BACKUP_HOUR_UTC'
+assert_rendered 'name: HERMES_BACKUP_STAGGER_MINUTES'
+assert_rendered 'resources: ["cronjobs"]'
+assert_rendered 'name: hermes-backup-maintenance'
+assert_rendered 'schedule: "30 6 * * *"'
+assert_rendered 'concurrencyPolicy: Forbid'
+assert_rendered 'forget --tag hermes-agent --group-by host --keep-daily 7 --keep-weekly 4 --keep-monthly 6'
+assert_rendered 'restic_nas prune'
+assert_rendered 'restic_nas check'
+assert_not_rendered 'forget --tag scheduled'
+assert_rendered 'kind: PrometheusRule'
+assert_rendered 'release: monitoring'
+assert_rendered 'alert: HermesBackupJobFailed'
+assert_rendered 'kube_job_status_failed'
+assert_rendered 'alert: HermesBackupStale'
+assert_rendered 'kube_cronjob_status_last_successful_time'
+assert_rendered 'kube_cronjob_created'
+assert_rendered '26 * 3600'
+assert_rendered 'unless on(namespace, cronjob)'
+assert_rendered 'prometheusrules.monitoring.coreos.com'
+assert_rendered '/apis/monitoring.coreos.com/v1'
+assert_not_rendered 'kind: PrometheusRule' "$rendered_no_monitoring"
+assert_not_rendered 'prometheusrules.monitoring.coreos.com' "$rendered_no_monitoring"
+assert_not_rendered '/apis/monitoring.coreos.com/v1' "$rendered_no_monitoring"
