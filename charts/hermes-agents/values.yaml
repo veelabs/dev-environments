@@ -6,7 +6,7 @@ temporal:
   taskQueue: hermes-agents
 
 worker:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0@sha256:416fe0ee177c7acf5a16d922f646bf933df35b22d7b8c522b960028d4c29c5c6
   resources:
     requests:
       cpu: 50m
@@ -15,7 +15,7 @@ worker:
       memory: 128Mi
 
 landing:
-  image: ghcr.io/veelabs/dev-environments-landing:0.9.0
+  image: ghcr.io/veelabs/dev-environments-landing:0.9.0@sha256:1e7d4a164d3f04b1c7796050dbfca3b646ed25d5befda982a5936d5aa1b9d0bf
   subdomain: agents
   resources:
     requests:
@@ -66,5 +66,5 @@ hermes:
 
 preflight:
   enabled: true
-  kubectlImage: rancher/kubectl:v1.35.0
-  busyboxImage: busybox:1.37
+  kubectlImage: rancher/kubectl:v1.35.0@sha256:63a9f14d017459f47d23cb266b2857e82ffe6602d8955eef00ce111b2d8a61cf
+  busyboxImage: busybox:1.37@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028

@@ -17,7 +17,7 @@ sandbox:
   # SandboxTemplate name; the zero-replica warm pool is derived from it as
   # shadow-pool-<templateName> (load-bearing name, see docs/runbook.md).
   templateName: opencode-dev
-  image: ghcr.io/veelabs/dev-environments-sandbox:1.17.15-1.14.1
+  image: ghcr.io/veelabs/dev-environments-sandbox:1.17.15-1.14.1@sha256:3805221aa034d0bc34beca8098ab12b0a3f6508d9db9b008efe1e5efd1face28
   # In-pod port OpenChamber listens on. Non-default (1982) keeps framework
   # favourites (3000, 5173, 8080...) free for user apps.
   port: 1982
@@ -30,7 +30,7 @@ sandbox:
       memory: 1536Mi
 
 provisioner:
-  image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0
+  image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0@sha256:416fe0ee177c7acf5a16d922f646bf933df35b22d7b8c522b960028d4c29c5c6
   resources:
     requests:
       cpu: 50m
@@ -44,7 +44,7 @@ landing:
   # hostnames are always oc-<name>.<baseDomain>, never bare oc.
   enabled: true
   subdomain: oc
-  image: ghcr.io/veelabs/dev-environments-landing:0.3.3
+  image: ghcr.io/veelabs/dev-environments-landing:0.3.3@sha256:12a9254b1d93952e848527bb76332223f3cac8607531bd52f9402d0d9cd1a4fa
   # Lifetime granted to devboxes claimed from the page (Go duration).
   claimTTL: 1h
   # Running ProvisionDevEnvironment workflows allowed before the page answers
@@ -58,7 +58,7 @@ landing:
       memory: 64Mi
 
 portRouter:
-  image: nginx:1.29-alpine
+  image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
   # Bump to force a pod restart when the nginx ConfigMap changes.
   configRevision: "1"
   resources:
@@ -72,5 +72,5 @@ ingressClassName: traefik
 
 preflight:
   enabled: true
-  kubectlImage: rancher/kubectl:v1.35.0
-  busyboxImage: busybox:1.37
+  kubectlImage: rancher/kubectl:v1.35.0@sha256:63a9f14d017459f47d23cb266b2857e82ffe6602d8955eef00ce111b2d8a61cf
+  busyboxImage: busybox:1.37@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028

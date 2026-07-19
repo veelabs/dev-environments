@@ -30,9 +30,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+      - run: charts/dev-environments/tests/render.sh
       - run: charts/hermes-agents/tests/render.sh
       - name: Test Hermes backup alerts
         run: charts/hermes-agents/tests/test-alerts.sh
+
+  custom-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and smoke custom images
+        run: |
+          set -euo pipefail
+
+          docker build -t sandbox-smoke images/sandbox
+          test "$(docker inspect --format '{{.Config.User}}' sandbox-smoke)" = node
+          docker run --rm sandbox-smoke sh -ceu \
+            'command -v opencode openchamber git curl jq rg unzip'
+          docker run -d --name sandbox-smoke -p 3000:3000 sandbox-smoke
+
+          docker build -t landing-smoke -f images/landing/Dockerfile .
+          test "$(docker inspect --format '{{.Config.User}}' landing-smoke)" = nonroot
+          docker run -d --name landing-smoke -p 8642:8642 \
+            -e LANDING_KIND=router -e TAILNET_CIDR=127.0.0.0/8 landing-smoke
+
+          docker build -t worker-smoke -f images/provisioner/Dockerfile .
+          test "$(docker inspect --format '{{.Config.User}}' worker-smoke)" = nonroot
+          if docker run --rm -e WORKER_KIND=invalid worker-smoke >worker.log 2>&1; then
+            echo "worker accepted invalid startup configuration" >&2
+            exit 1
+          fi
+          grep -Fq 'WORKER_KIND must be dev-environments or hermes' worker.log
+
+          trap 'docker logs sandbox-smoke; docker logs landing-smoke; docker rm -f sandbox-smoke landing-smoke' EXIT
+          for _ in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null &&
+               test "$(curl -sS -o router.json -w '%{http_code}' http://127.0.0.1:8642/)" = 400; then
+              grep -Fq 'missing-agent' router.json
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
 
   hermes-image:
     runs-on: ubuntu-latest

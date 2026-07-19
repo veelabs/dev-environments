@@ -155,81 +155,9 @@ ephemeral filesystem and die with the TTL — by design.
 
 ## Hermes backup operations
 
-Every Hermes agent with a retained PVC has a daily
-`hermes-backup-<hash>` CronJob. Stopping runtime keeps that schedule;
-removing the PVC removes it. The chart spreads agents through the configured UTC
-window and uses `concurrencyPolicy: Forbid`, so one agent cannot overlap itself.
-The landing page reports the last scheduled attempt, success, failure, and next
-run. The recovery-point objective is one daily interval: up to 24 hours of
-agent changes can be lost with the PVC.
-
-Inspect or exercise one schedule without changing the workflow:
-
-```sh
-agent=agent-calm-fox
-cronjob=$(kubectl -n hermes-agents get cronjob \
-  -l "renala.dev/agent-id=$agent,renala.dev/hermes-scheduled-backup=true" \
-  -o jsonpath='{.items[0].metadata.name}')
-job="$cronjob-verify-$(date +%s)"
-kubectl -n hermes-agents create job "$job" --from="cronjob/$cronjob"
-kubectl -n hermes-agents wait "job/$job" --for=condition=complete --timeout=70m
-kubectl -n hermes-agents get "job/$job" -o wide
-```
-
-Snapshots use host `<agent-id>` and tags `hermes-agent` and
-`agent:<agent-id>`. The maintenance CronJob selects only `hermes-agent`, groups
-retention by host, keeps 7 daily / 4 weekly / 6 monthly snapshots per agent,
-then prunes and checks. It retries repository lock contention and never runs
-`restic unlock` automatically. Before manual unlock, verify the data-tier
-backup service and every Hermes backup/maintenance Job are inactive; unlocking
-an active writer can corrupt repository operations.
-
-`HermesBackupJobFailed` alerts on failed manual or scheduled Jobs.
-`HermesBackupStale` alerts after 26 hours without success, including schedules
-that have never succeeded. Monitoring is disabled only by explicitly setting
-`monitoring.enabled=false`; when enabled, preflight requires the
-`monitoring.coreos.com/v1` API.
-
-The Hermes and data-tier clients share one repository password and NAS
-write/delete identity. Host and tag filters prevent accidental cross-retention,
-not malicious access. A compromised client can read or delete every recovery
-point in the repository.
-
-## Hermes data deletion and restore
-
-Use the agent card on `agents.<baseDomain>` for the normal recovery lifecycle:
-
-1. **Delete data** requires typing the full `agent-...` identity. The workflow
-   stops runtime, creates and verifies a final Hermes/restic backup, then removes
-   the PVC and its backup schedule. The Temporal entity, generated dashboard
-   credentials, and NAS snapshots remain in `backup-only` state.
-2. If the final backup fails, deletion is blocked. Fix the reported NAS/archive
-   problem and retry. **Force delete data** appears only after that failure and
-   requires typing the full identity again; use it only when losing changes
-   newer than the last successful snapshot is acceptable.
-3. In `backup-only`, choose a restore point by timestamp and full snapshot ID.
-   The newest point is selected by default. Restore creates a fresh `5Gi` PVC,
-   downloads that exact agent snapshot, validates the ZIP and SQLite databases,
-   and runs native `hermes import` before any Sandbox is created.
-4. A successful import starts the current pinned runtime and verifies both the
-   dashboard and API. A failed download, validation, or import removes partial
-   PVC data, leaves the source snapshot untouched, and keeps Restore retryable.
-
-Start and Backup are intentionally unavailable without a PVC. Stop remains a
-no-op in `backup-only`; Forget remains available and removes only the catalog
-entity and generated dashboard credentials, never NAS snapshots.
-
-Inspect a failed recovery without exposing repository credentials:
-
-```sh
-kubectl -n hermes-agents get jobs,pods,pvc -l renala.dev/agent-id=agent-calm-fox
-kubectl -n hermes-agents describe job -l renala.dev/agent-id=agent-calm-fox
-kubectl -n hermes-agents logs job/hermes-restore-<hash> -c restore
-kubectl -n hermes-agents logs job/hermes-restore-<hash> -c import
-```
-
-Repository credentials are mounted only into worker-created restic containers.
-The landing API and Temporal status contain only snapshot IDs and timestamps.
+See [`hermes-runbook.md`](hermes-runbook.md) for Hermes creation, credentials,
+private API clients, complete lifecycle semantics, image upgrades, capacity,
+backup monitoring, restore, cancellation, termination, and Forget.
 
 ## One-time edge setup (DR checklist)
 
