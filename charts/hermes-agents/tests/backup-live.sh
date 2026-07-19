@@ -7,18 +7,21 @@ set -euo pipefail
 run_id="hermes-backup-test-$$"
 fixture="${run_id}-fixture"
 restored="${run_id}-restored"
+archive="${run_id}-archive"
+repository="${run_id}-repository"
+recovery="${run_id}-recovery"
 writer="${run_id}-writer"
 tmp="$(mktemp -d)"
 cleanup() {
   docker rm -f "$writer" >/dev/null 2>&1 || true
-  docker volume rm "$fixture" "$restored" >/dev/null 2>&1 || true
+  docker volume rm "$fixture" "$restored" "$archive" "$repository" "$recovery" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
 
-docker volume create "$fixture" >/dev/null
-docker volume create "$restored" >/dev/null
-mkdir -p "$tmp/archive" "$tmp/repository" "$tmp/restore"
+for volume in "$fixture" "$restored" "$archive" "$repository" "$recovery"; do
+  docker volume create "$volume" >/dev/null
+done
 
 docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
   -v "$fixture:/opt/data" "$HERMES_IMAGE" -c '
@@ -55,11 +58,11 @@ test "${rows:-0}" -gt 1
 test "$(docker inspect --format '{{.State.Running}}' "$writer")" = true
 
 docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes \
-  -v "$fixture:/opt/data:ro" -v "$tmp/archive:/backup" \
+  -v "$fixture:/opt/data:ro" -v "$archive:/backup" \
   "$HERMES_IMAGE" backup --output /backup/hermes.zip
 
 docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
-  -v "$tmp/archive:/backup:ro" "$HERMES_IMAGE" -c '
+  -v "$archive:/backup:ro" "$HERMES_IMAGE" -c '
 import pathlib, shutil, sqlite3, tempfile, zipfile
 archive = pathlib.Path("/backup/hermes.zip")
 assert archive.stat().st_size > 0
@@ -79,15 +82,15 @@ with zipfile.ZipFile(archive) as source:
 '
 
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
-  -v "$tmp/repository:/repo" "$RESTIC_IMAGE" init --repo /repo
+  -v "$repository:/repo" "$RESTIC_IMAGE" init --repo /repo
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
-  -v "$tmp/repository:/repo" -v "$tmp/archive:/backup:ro" "$RESTIC_IMAGE" \
+  -v "$repository:/repo" -v "$archive:/backup:ro" "$RESTIC_IMAGE" \
   --repo /repo backup --host agent-live-fixture --tag hermes-agent \
   --tag agent:agent-live-fixture /backup/hermes.zip
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
-  -v "$tmp/repository:/repo" "$RESTIC_IMAGE" --repo /repo check
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo check
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
-  -v "$tmp/repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json \
+  -v "$repository:/repo" "$RESTIC_IMAGE" --repo /repo snapshots --json \
   --host agent-live-fixture --tag hermes-agent --tag agent:agent-live-fixture >"$tmp/snapshots.json"
 python3 - "$tmp/snapshots.json" <<'PY'
 import json, pathlib, sys
@@ -97,12 +100,12 @@ assert snapshots[0]["hostname"] == "agent-live-fixture"
 assert {"hermes-agent", "agent:agent-live-fixture"} <= set(snapshots[0]["tags"])
 PY
 docker run --rm -e RESTIC_PASSWORD=disposable-test-password \
-  -v "$tmp/repository:/repo:ro" -v "$tmp/restore:/restore" "$RESTIC_IMAGE" \
+  -v "$repository:/repo" -v "$recovery:/restore" "$RESTIC_IMAGE" \
   --repo /repo restore latest --target /restore --host agent-live-fixture \
   --tag hermes-agent --tag agent:agent-live-fixture
 
 docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes \
-  -v "$restored:/opt/data" -v "$tmp/restore:/restore:ro" "$HERMES_IMAGE" \
+  -v "$restored:/opt/data" -v "$recovery:/restore:ro" "$HERMES_IMAGE" \
   import /restore/backup/hermes.zip --force
 docker run --rm --entrypoint /opt/hermes/.venv/bin/python \
   -v "$restored:/opt/data:ro" "$HERMES_IMAGE" -c '
