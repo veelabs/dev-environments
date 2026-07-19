@@ -3,6 +3,7 @@ package activities
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 const (
 	hermesSeedIDAnnotation = "renala.dev/hermes-seed-id"
 	hermesBootstrapLabel   = "renala.dev/hermes-bootstrap"
+	hermesBackupLabel      = "renala.dev/hermes-backup"
 )
 
 const hermesBootstrapScript = `
@@ -50,6 +52,66 @@ with zipfile.ZipFile(io.BytesIO(archive)) as source:
         if target != root and root not in target.parents:
             raise SystemExit(f"profile bundle contains unsafe path: {member.filename}")
     source.extractall(root)
+`
+
+const hermesBackupScript = `
+import pathlib
+import shutil
+import sqlite3
+import stat
+import subprocess
+import tempfile
+import zipfile
+
+archive = pathlib.Path("/backup/hermes.zip")
+result = subprocess.run(
+    ["/opt/hermes/.venv/bin/hermes", "backup", "--output", str(archive)],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+print(result.stdout, end="")
+if result.returncode:
+    raise SystemExit("Hermes backup command failed")
+if "SQLite safe copy failed" in result.stdout or "Warnings (" in result.stdout:
+    raise SystemExit("Hermes backup reported incomplete output")
+if not archive.is_file() or not archive.stat().st_size:
+    raise SystemExit("Hermes backup did not produce an archive")
+
+markers = {"config.yaml", ".env", "state.db"}
+found = set()
+with zipfile.ZipFile(archive) as source:
+    corrupt = source.testzip()
+    if corrupt:
+        raise SystemExit(f"Hermes backup contains corrupt entry: {corrupt}")
+    for member in source.infolist():
+        path = pathlib.PurePosixPath(member.filename)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"Hermes backup contains unsafe path: {member.filename}")
+        mode = member.external_attr >> 16
+        if stat.S_ISLNK(mode) or (mode and not stat.S_ISREG(mode) and not stat.S_ISDIR(mode)):
+            raise SystemExit(f"Hermes backup contains non-regular entry: {member.filename}")
+        found.add(path.name)
+        if path.suffix != ".db" or member.is_dir():
+            continue
+        with tempfile.NamedTemporaryFile(suffix=".db", dir="/backup") as target:
+            with source.open(member) as database:
+                shutil.copyfileobj(database, target)
+            target.flush()
+            connection = sqlite3.connect(f"file:{target.name}?mode=ro", uri=True)
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            connection.close()
+            if integrity != "ok":
+                raise SystemExit(f"Hermes backup contains invalid SQLite database: {member.filename}")
+if not markers.intersection(found):
+    raise SystemExit("Hermes backup has no Hermes state marker")
+`
+
+const hermesResticBackupScript = `
+mkdir -p "$HOME/.ssh" "$RESTIC_CACHE_DIR"
+result="$(restic -o 'sftp.args=-i /secret/ssh-privatekey -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new' backup --json --quiet --host "$AGENT_ID" --tag hermes-agent --tag "agent:$AGENT_ID" /backup/hermes.zip)"
+printf '%s\n' "$result" >/backup/restic-result.json
+tail -n 1 /backup/restic-result.json >/dev/termination-log
 `
 
 type CreateHermesPVCInput struct {
@@ -94,6 +156,11 @@ type CreateHermesIngressInput struct {
 type HermesResources struct {
 	RuntimePresent bool
 	PVCPresent     bool
+}
+
+type BackupHermesOutput struct {
+	SnapshotID   string
+	SnapshotTime string
 }
 
 func hermesLabels(agentID string) map[string]string {
@@ -272,7 +339,10 @@ func (a *Activities) hermesBootstrapPodDiagnostic(ctx context.Context, agentID s
 }
 
 func (a *Activities) DeleteHermesBootstrap(ctx context.Context, agentID string) error {
-	name := agentID
+	return a.deleteHermesJob(ctx, agentID)
+}
+
+func (a *Activities) deleteHermesJob(ctx context.Context, name string) error {
 	foreground := metav1.DeletePropagationForeground
 	jobErr := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &foreground})
 	if jobErr != nil && !apierrors.IsNotFound(jobErr) {
@@ -295,6 +365,154 @@ func (a *Activities) DeleteHermesBootstrap(ctx context.Context, agentID string) 
 		}
 	}
 	return nil
+}
+
+func hermesBackupJobName(agentID string) string {
+	digest := sha256.Sum256([]byte(agentID))
+	return fmt.Sprintf("hermes-backup-%x", digest[:8])
+}
+
+func (a *Activities) BackupHermes(ctx context.Context, agentID string) (BackupHermesOutput, error) {
+	activeDeadlineSeconds := int64(3600)
+	backoffLimit := int32(0)
+	ttlSecondsAfterFinished := int32(3600)
+	automountServiceAccountToken := false
+	enableServiceLinks := false
+	defaultMode := int32(0o400)
+	jobName := hermesBackupJobName(agentID)
+	podLabels := hermesLabels(agentID)
+	podLabels[hermesBackupLabel] = "true"
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: a.cfg.SandboxNamespace, Labels: podLabels},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   &activeDeadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec: corev1.PodSpec{
+					AutomountServiceAccountToken: &automountServiceAccountToken,
+					EnableServiceLinks:           &enableServiceLinks,
+					RestartPolicy:                corev1.RestartPolicyNever,
+					SecurityContext: &corev1.PodSecurityContext{
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					InitContainers: []corev1.Container{{
+						Name:    "archive",
+						Image:   a.cfg.HermesImage,
+						Command: []string{"/opt/hermes/.venv/bin/python", "-c"},
+						Args:    []string{hermesBackupScript},
+						Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi"),
+							corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+						}},
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: &automountServiceAccountToken,
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "data", MountPath: "/opt/data", ReadOnly: true},
+							{Name: "backup", MountPath: "/backup"},
+						},
+					}},
+					Containers: []corev1.Container{{
+						Name:    "upload",
+						Image:   a.cfg.HermesResticImage,
+						Command: []string{"/bin/sh", "-ceu"},
+						Args:    []string{hermesResticBackupScript},
+						Env: []corev1.EnvVar{
+							{Name: "AGENT_ID", Value: agentID},
+							{Name: "HOME", Value: "/backup/home"},
+							{Name: "RESTIC_CACHE_DIR", Value: "/backup/restic-cache"},
+							{Name: "RESTIC_REPOSITORY", Value: a.cfg.HermesBackupRepository},
+							{Name: "RESTIC_PASSWORD_FILE", Value: "/secret/RESTIC_PASSWORD"},
+						},
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+						Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+							corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"),
+							corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+						}},
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: &automountServiceAccountToken,
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "backup", MountPath: "/backup"},
+							{Name: "secret", MountPath: "/secret", ReadOnly: true},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: agentID, ReadOnly: true}}},
+						{Name: "backup", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: resource.NewQuantity(10<<30, resource.BinarySI)}}},
+						{Name: "secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: a.cfg.HermesBackupSecret, DefaultMode: &defaultMode}}},
+					},
+				},
+			},
+		},
+	}
+	if _, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return BackupHermesOutput{}, fmt.Errorf("create backup pod: %w", err)
+	}
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		activity.RecordHeartbeat(ctx, "waiting for Hermes backup")
+		job, err := a.kube.BatchV1().Jobs(a.cfg.SandboxNamespace).Get(ctx, jobName, metav1.GetOptions{})
+		if err != nil {
+			return BackupHermesOutput{}, fmt.Errorf("inspect backup pod: %w", err)
+		}
+		if job.Labels["renala.dev/agent-id"] != agentID {
+			return BackupHermesOutput{}, temporal.NewNonRetryableApplicationError("backup pod identity conflict", "BackupIdentityConflict", nil)
+		}
+		for _, condition := range job.Status.Conditions {
+			if condition.Status != corev1.ConditionTrue {
+				continue
+			}
+			switch condition.Type {
+			case batchv1.JobComplete:
+				return a.hermesBackupOutput(ctx, jobName)
+			case batchv1.JobFailed:
+				activity.GetLogger(ctx).Error("Hermes backup pod failed", "agentID", agentID, "reason", condition.Reason, "message", condition.Message)
+				return BackupHermesOutput{}, temporal.NewNonRetryableApplicationError("backup archive validation or repository upload failed", "HermesBackupFailed", nil)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return BackupHermesOutput{}, temporal.NewNonRetryableApplicationError("backup timed out; inspect the backup pod", "HermesBackupTimeout", ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+func (a *Activities) hermesBackupOutput(ctx context.Context, jobName string) (BackupHermesOutput, error) {
+	pods, err := a.kube.CoreV1().Pods(a.cfg.SandboxNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{batchv1.JobNameLabel: jobName}.AsSelector().String(),
+	})
+	if err != nil {
+		return BackupHermesOutput{}, temporal.NewApplicationError("backup completed but snapshot identity is unavailable", "HermesBackupMetadataMissing")
+	}
+	for _, pod := range pods.Items {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name != "upload" || status.State.Terminated == nil {
+				continue
+			}
+			var summary struct {
+				MessageType string `json:"message_type"`
+				SnapshotID  string `json:"snapshot_id"`
+				BackupStart string `json:"backup_start"`
+			}
+			if json.Unmarshal([]byte(status.State.Terminated.Message), &summary) == nil && summary.MessageType == "summary" && summary.SnapshotID != "" {
+				if _, err := time.Parse(time.RFC3339Nano, summary.BackupStart); err == nil {
+					return BackupHermesOutput{SnapshotID: summary.SnapshotID, SnapshotTime: summary.BackupStart}, nil
+				}
+			}
+		}
+	}
+	return BackupHermesOutput{}, temporal.NewApplicationError("backup completed but snapshot identity is unavailable", "HermesBackupMetadataMissing")
+}
+
+func (a *Activities) DeleteHermesBackup(ctx context.Context, agentID string) error {
+	return a.deleteHermesJob(ctx, hermesBackupJobName(agentID))
 }
 
 func (a *Activities) DeleteHermesSeed(ctx context.Context, ref profilebundle.Ref) error {

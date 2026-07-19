@@ -107,6 +107,17 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {memory: 32Mi}
+        - name: backup-secret-check
+          image: {{ .Values.preflight.busyboxImage }}
+          command: ["sh", "-c"]
+          args: ["test -s /secret/RESTIC_PASSWORD && test -s /secret/ssh-privatekey"]
+          volumeMounts:
+            - name: backup-secret
+              mountPath: /secret
+              readOnly: true
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
       volumes:
         - name: api-secret
           secret:
@@ -114,4 +125,12 @@ spec:
             items:
               - key: key
                 path: key
+        - name: backup-secret
+          secret:
+            secretName: {{ .Values.backup.secretName | quote }}
+            items:
+              - key: RESTIC_PASSWORD
+                path: RESTIC_PASSWORD
+              - key: ssh-privatekey
+                path: ssh-privatekey
 {{- end }}

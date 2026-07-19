@@ -10,6 +10,7 @@ permissions:
 
 env:
   HERMES_IMAGE: docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a
+  RESTIC_IMAGE: docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510
 
 jobs:
   go:
@@ -78,5 +79,12 @@ jobs:
             for service in gateway-default dashboard; do
               state=$(/command/s6-svstat "/run/service/$service")
               case "$state" in "up "*) ;; *) exit 1 ;; esac
-            done
+           done
           '
+
+  hermes-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Back up and restore live WAL state
+        run: charts/hermes-agents/tests/backup-live.sh

@@ -7,13 +7,16 @@ rendered_custom="$(mktemp)"
 trap 'rm -f "$rendered" "$rendered_custom"' EXIT
 
 helm lint "$chart" --set-string baseDomain=example.test \
-  --set-string router.hostname=homelab-server.example.ts.net
-helm template hermes-agents "$chart" --namespace hermes-agents \
-	--set-string baseDomain=example.test \
-	--set-string router.hostname=homelab-server.example.ts.net >"$rendered"
+  --set-string router.hostname=homelab-server.example.ts.net \
+  --set-string backup.repository=sftp:user@nas:/repo
 helm template hermes-agents "$chart" --namespace hermes-agents \
 	--set-string baseDomain=example.test \
 	--set-string router.hostname=homelab-server.example.ts.net \
+	--set-string backup.repository=sftp:user@nas:/repo >"$rendered"
+helm template hermes-agents "$chart" --namespace hermes-agents \
+	--set-string baseDomain=example.test \
+	--set-string router.hostname=homelab-server.example.ts.net \
+	--set-string backup.repository=sftp:user@nas:/repo \
 	--set-string 'hermes.gitAllowedHosts[0]=github.com' \
 	--set-string 'hermes.gitAllowedHosts[1]=gitlab.com' >"$rendered_custom"
 
@@ -40,8 +43,8 @@ assert_rendered 'name: hermes-landing'
 assert_rendered 'value: "hermes"'
 assert_rendered 'host: "agents.example.test"'
 assert_rendered 'path: /healthz'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.6.0'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.7.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.7.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.8.0'
 assert_rendered 'verbs: ["get", "list"]'
 assert_rendered 'verbs: ["get", "list", "watch", "create", "delete", "update"]'
 assert_rendered 'name: hermes-api-router'
@@ -65,3 +68,8 @@ assert_rendered 'verbs: ["get", "list", "create", "delete"]'
 assert_rendered 'name: hermes-bootstrap-deny-all'
 assert_rendered 'renala.dev/hermes-bootstrap: "true"'
 assert_rendered 'policyTypes: ["Ingress", "Egress"]'
+assert_rendered 'docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510'
+assert_rendered 'name: HERMES_BACKUP_REPOSITORY'
+assert_rendered 'value: "sftp:user@nas:/repo"'
+assert_rendered 'test -s /secret/RESTIC_PASSWORD && test -s /secret/ssh-privatekey'
+assert_rendered 'secretName: "hermes-backup"'

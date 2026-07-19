@@ -46,6 +46,8 @@
   .phase.error { color:var(--red); background:#f6dddd; }
   .meta { color:var(--muted); font:12px ui-monospace,monospace; overflow-wrap:anywhere; margin:8px 0 0; }
   .error { color:var(--red); margin:10px 0 0; font-size:13px; }
+  .backup { margin:12px 0 0; padding:10px 12px; border-left:3px solid var(--violet); background:#f2eee7; }
+  .backup p { margin:2px 0; }
   .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
   .actions .danger { color:var(--red); margin-left:auto; }
   .credentials { margin-top:12px; padding:12px; border-radius:10px; background:#f0ece3; font:13px ui-monospace,monospace; overflow-wrap:anywhere; }
@@ -105,13 +107,14 @@
   }
 
   const escapeHTML = value => String(value || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
-  const transitional = phase => ["storage","bootstrap","credentials","starting","wiring","verifying","stopping","rotating-credentials","forgetting"].includes(phase);
+  const transitional = phase => ["storage","bootstrap","credentials","starting","wiring","verifying","stopping","rotating-credentials","backing-up","forgetting"].includes(phase);
 
   function card(agent) {
     const id = escapeHTML(agent.agentId), phase = escapeHTML(agent.phase);
-    const running = agent.phase === "running", stopped = agent.phase === "stopped", bootstrapError = agent.phase === "error" && String(agent.lastError || "").startsWith("bootstrap:"), locked = busy.has(agent.agentId) || transitional(agent.phase);
+    const running = agent.phase === "running", stopped = agent.phase === "stopped", failed = agent.phase === "error", bootstrapError = failed && String(agent.lastError || "").startsWith("bootstrap:"), locked = busy.has(agent.agentId) || transitional(agent.phase), backup = agent.backup || {};
+    const backupDetails = backup.phase ? `<div class="backup"><p class="meta">backup: ${escapeHTML(backup.phase)}</p>${backup.lastAttemptAt ? `<p class="meta">last attempt: ${escapeHTML(backup.lastAttemptAt)}</p>` : ""}${backup.lastSuccessAt ? `<p class="meta">last success: ${escapeHTML(backup.lastSuccessAt)}</p>` : ""}${backup.snapshotId ? `<p class="meta">snapshot: ${escapeHTML(backup.snapshotId)}${backup.snapshotTime ? ` · ${escapeHTML(backup.snapshotTime)}` : ""}</p>` : ""}${backup.lastError ? `<p class="error">${escapeHTML(backup.lastError)}</p>` : ""}</div>` : "";
     const forget = `<button class="danger" data-action="forget" ${(stopped || bootstrapError) && !locked ? "" : "disabled"} title="Available after runtime and persistent data are removed">Forget</button>`;
-    return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}<div class="actions"><button data-action="start" ${running || bootstrapError || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || locked ? "disabled" : ""}>Stop</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button>${forget}</div><div class="credentials" hidden></div></article>`;
+    return `<article class="panel agent" data-id="${id}"><div class="agent-head"><div><h3>${id}</h3>${agent.dashboardUrl ? `<a href="${escapeHTML(agent.dashboardUrl)}" target="_blank" rel="noopener">Open dashboard ↗</a>` : ""}</div><span class="phase ${phase}">${phase}</span></div>${agent.image ? `<p class="meta">${escapeHTML(agent.image)}</p>` : ""}${agent.lastError ? `<p class="error">${escapeHTML(agent.lastError)}</p>` : ""}${backupDetails}<div class="actions"><button data-action="start" ${running || bootstrapError || locked ? "disabled" : ""}>Start</button><button data-action="stop" ${stopped || locked ? "disabled" : ""}>Stop</button><button data-action="backup" ${(running || stopped || failed) && !locked ? "" : "disabled"}>Backup now</button><button data-action="reveal">Reveal credentials</button><button data-action="rotate" ${locked ? "disabled" : ""}>Rotate</button>${forget}</div><div class="credentials" hidden></div></article>`;
   }
 
   async function load() {

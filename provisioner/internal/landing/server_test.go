@@ -474,7 +474,7 @@ func TestHermesLifecycleRequestsSignalTheEntity(t *testing.T) {
 	f := &fakeTemporal{}
 	h := newHermesTestServer(f).Handler()
 
-	for _, operation := range []string{"stop", "start", "credentials/rotate"} {
+	for _, operation := range []string{"stop", "start", "backup", "credentials/rotate"} {
 		rec, _ := doJSONBody(t, h, http.MethodPost, "/api/agents/agent-calm-fox/"+operation, `{}`)
 		require.Equal(t, http.StatusAccepted, rec.Code)
 	}
@@ -487,6 +487,7 @@ func TestHermesLifecycleRequestsSignalTheEntity(t *testing.T) {
 	require.Equal(t, []fakeSignal{
 		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationStop}},
 		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationStart}},
+		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationBackup}},
 		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationRotateCredentials}},
 		{workflowID: "agent-calm-fox", name: wf.HermesOperationSignal, value: wf.HermesOperation{Type: wf.HermesOperationForget, Confirmation: "agent-calm-fox"}},
 	}, f.signals)
@@ -642,6 +643,7 @@ func TestServesDedicatedHermesLandingPage(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "Reveal API token")
 	require.Contains(t, rec.Body.String(), "X-Hermes-Agent")
 	require.Contains(t, rec.Body.String(), "Authorization")
+	require.Contains(t, rec.Body.String(), "Backup now")
 	require.NotContains(t, rec.Body.String(), `\n+`)
 	require.NotContains(t, rec.Body.String(), "provider key")
 }

@@ -26,6 +26,60 @@ import (
 )
 
 const hermesTestImage = "docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a"
+const resticTestImage = "docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510"
+
+func TestBackupHermesJobUsesReadOnlyStateAndEphemeralVerifiedArchive(t *testing.T) {
+	ctx := context.Background()
+	kube := fake.NewClientset()
+	a := New(config.Config{
+		SandboxNamespace:       "hermes-agents",
+		HermesImage:            hermesTestImage,
+		HermesResticImage:      resticTestImage,
+		HermesBackupSecret:     "hermes-backup",
+		HermesBackupRepository: "sftp:user@nas:/repo",
+	}, nil, kube)
+	completeHermesBackupJob(t, ctx, kube, "agent-calm-fox", `{"message_type":"summary","snapshot_id":"0123456789abcdef","backup_start":"2026-07-19T10:11:12Z"}`)
+	var suite testsuite.WorkflowTestSuite
+	activityEnv := suite.NewTestActivityEnvironment().SetTestTimeout(3 * time.Second)
+	activityEnv.RegisterActivity(a)
+
+	value, err := activityEnv.ExecuteActivity(a.BackupHermes, "agent-calm-fox")
+	require.NoError(t, err)
+	var output BackupHermesOutput
+	require.NoError(t, value.Get(&output))
+	require.Equal(t, BackupHermesOutput{SnapshotID: "0123456789abcdef", SnapshotTime: "2026-07-19T10:11:12Z"}, output)
+
+	job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, hermesBackupJobName("agent-calm-fox"), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, *job.Spec.Template.Spec.AutomountServiceAccountToken)
+	require.Len(t, job.Spec.Template.Spec.InitContainers, 1)
+	archive := job.Spec.Template.Spec.InitContainers[0]
+	require.Equal(t, hermesTestImage, archive.Image)
+	require.Equal(t, []string{"/opt/hermes/.venv/bin/python", "-c"}, archive.Command)
+	require.Contains(t, archive.Args[0], `"/opt/hermes/.venv/bin/hermes", "backup"`)
+	require.Contains(t, archive.Args[0], "SQLite safe copy failed")
+	require.Contains(t, archive.Args[0], "testzip")
+	require.True(t, archive.VolumeMounts[0].ReadOnly)
+	require.Equal(t, "/opt/data", archive.VolumeMounts[0].MountPath)
+	require.Len(t, job.Spec.Template.Spec.Containers, 1)
+	uploader := job.Spec.Template.Spec.Containers[0]
+	require.Equal(t, resticTestImage, uploader.Image)
+	require.Contains(t, uploader.Args[0], `--host "$AGENT_ID"`)
+	require.Contains(t, uploader.Args[0], "--tag hermes-agent")
+	require.Contains(t, uploader.Args[0], `--tag "agent:$AGENT_ID"`)
+	require.NotContains(t, uploader.Args[0], "disposable-test-password")
+	require.Len(t, job.Spec.Template.Spec.Volumes, 3)
+	require.True(t, job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ReadOnly)
+	require.NotNil(t, job.Spec.Template.Spec.Volumes[1].EmptyDir)
+	require.Equal(t, "10Gi", job.Spec.Template.Spec.Volumes[1].EmptyDir.SizeLimit.String())
+	require.Equal(t, "hermes-backup", job.Spec.Template.Spec.Volumes[2].Secret.SecretName)
+	jobJSON, err := json.Marshal(job)
+	require.NoError(t, err)
+	require.NotContains(t, string(jobJSON), "BEGIN OPENSSH PRIVATE KEY")
+
+	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
+	require.NoError(t, a.DeleteHermesBackup(ctx, "agent-calm-fox"))
+}
 
 func TestHermesPersistentResourcesAndSandboxContract(t *testing.T) {
 	ctx := context.Background()
@@ -349,6 +403,32 @@ func completeHermesBootstrapJob(t *testing.T, ctx context.Context, kube *fake.Cl
 			job.Status.Conditions = []batchv1.JobCondition{{
 				Type: condition, Status: corev1.ConditionTrue, Reason: reason, Message: message,
 			}}
+			_, err = kube.BatchV1().Jobs("hermes-agents").UpdateStatus(ctx, job, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			return
+		}
+	}()
+}
+
+func completeHermesBackupJob(t *testing.T, ctx context.Context, kube *fake.Clientset, agentID, message string) {
+	t.Helper()
+	go func() {
+		name := hermesBackupJobName(agentID)
+		for {
+			job, err := kube.BatchV1().Jobs("hermes-agents").Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			require.NoError(t, err)
+			_, err = kube.CoreV1().Pods("hermes-agents").Create(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "hermes-agents", Labels: map[string]string{batchv1.JobNameLabel: name}},
+				Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+					Name: "upload", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: message}},
+				}}},
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 			_, err = kube.BatchV1().Jobs("hermes-agents").UpdateStatus(ctx, job, metav1.UpdateOptions{})
 			require.NoError(t, err)
 			return

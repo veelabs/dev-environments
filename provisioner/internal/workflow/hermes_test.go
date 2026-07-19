@@ -41,9 +41,86 @@ func hermesEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	e.RegisterActivity(a.DeleteHermesSandbox)
 	e.RegisterActivity(a.AwaitHermesRuntimeAbsent)
 	e.RegisterActivity(a.RotateHermesCredentials)
+	e.RegisterActivity(a.BackupHermes)
+	e.RegisterActivity(a.DeleteHermesBackup)
 	e.RegisterActivity(a.InspectHermesResources)
 	e.RegisterActivity(a.DeleteHermesCredentials)
 	return e
+}
+
+func TestHermesAgentBacksUpLivePVCAndReportsSnapshot(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
+	e.OnActivity("InspectHermesResources", mock.Anything, "agent-calm-fox").
+		Return(activities.HermesResources{RuntimePresent: true, PVCPresent: true}, nil).Once()
+	e.OnActivity("BackupHermes", mock.Anything, "agent-calm-fox").Return(activities.BackupHermesOutput{
+		SnapshotID: "0123456789abcdef", SnapshotTime: "2026-07-19T10:11:12Z",
+	}, nil).Once()
+	e.OnActivity("DeleteHermesBackup", mock.Anything, "agent-calm-fox").Return(nil).Twice()
+	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("DeleteHermesService", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.RegisterDelayedCallback(func() {
+		e.SignalWorkflow(HermesOperationSignal, HermesOperation{Type: HermesOperationBackup})
+	}, time.Minute)
+	e.RegisterDelayedCallback(func() {
+		value, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var status HermesStatus
+		require.NoError(t, value.Get(&status))
+		require.Equal(t, HermesPhaseRunning, status.Phase)
+		require.Equal(t, HermesBackupPhaseSucceeded, status.Backup.Phase)
+		require.NotEmpty(t, status.Backup.LastAttemptAt)
+		require.NotEmpty(t, status.Backup.LastSuccessAt)
+		require.Equal(t, "0123456789abcdef", status.Backup.SnapshotID)
+		require.Equal(t, "2026-07-19T10:11:12Z", status.Backup.SnapshotTime)
+		e.CancelWorkflow()
+	}, 2*time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{
+		Name: "calm-fox", Initialized: true,
+		State: &HermesStatus{Phase: HermesPhaseRunning, AgentID: "agent-calm-fox"},
+	})
+
+	require.Error(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
+}
+
+func TestHermesAgentRedactsBackupFailureAndKeepsRuntimePhase(t *testing.T) {
+	e := hermesEnv(t)
+	e.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "agent-calm-fox"})
+	e.OnActivity("InspectHermesResources", mock.Anything, "agent-calm-fox").
+		Return(activities.HermesResources{RuntimePresent: true, PVCPresent: true}, nil).Once()
+	e.OnActivity("BackupHermes", mock.Anything, "agent-calm-fox").
+		Return(activities.BackupHermesOutput{}, temporal.NewNonRetryableApplicationError("sftp failed with password super-secret", "HermesBackupFailed", nil)).Once()
+	e.OnActivity("DeleteHermesBackup", mock.Anything, "agent-calm-fox").Return(nil).Twice()
+	e.OnActivity("DeleteHermesIngress", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("DeleteHermesService", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("DeleteHermesSandbox", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.OnActivity("AwaitHermesRuntimeAbsent", mock.Anything, "agent-calm-fox").Return(nil).Once()
+	e.RegisterDelayedCallback(func() {
+		e.SignalWorkflow(HermesOperationSignal, HermesOperation{Type: HermesOperationBackup})
+	}, time.Minute)
+	e.RegisterDelayedCallback(func() {
+		value, err := e.QueryWorkflow("status")
+		require.NoError(t, err)
+		var status HermesStatus
+		require.NoError(t, value.Get(&status))
+		require.Equal(t, HermesPhaseRunning, status.Phase)
+		require.Equal(t, HermesBackupPhaseFailed, status.Backup.Phase)
+		require.Contains(t, status.Backup.LastError, "NAS upload failed")
+		require.NotContains(t, status.Backup.LastError, "super-secret")
+		e.CancelWorkflow()
+	}, 2*time.Minute)
+
+	e.ExecuteWorkflow(ProvisionHermesAgent, HermesInput{
+		Name: "calm-fox", Initialized: true,
+		State: &HermesStatus{Phase: HermesPhaseRunning, AgentID: "agent-calm-fox"},
+	})
+
+	require.Error(t, e.GetWorkflowError())
+	e.AssertExpectations(t)
 }
 
 func TestHermesSeedBootstrapsOnceBeforeStopAndStart(t *testing.T) {

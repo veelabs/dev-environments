@@ -108,6 +108,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /api/agents/{id}", s.handleHermesStatus)
 		mux.HandleFunc("POST /api/agents/{id}/start", s.handleHermesOperation(wf.HermesOperationStart))
 		mux.HandleFunc("POST /api/agents/{id}/stop", s.handleHermesOperation(wf.HermesOperationStop))
+		mux.HandleFunc("POST /api/agents/{id}/backup", s.handleHermesOperation(wf.HermesOperationBackup))
 		mux.HandleFunc("POST /api/agents/{id}/credentials/rotate", s.handleHermesOperation(wf.HermesOperationRotateCredentials))
 		mux.HandleFunc("GET /api/agents/{id}/credentials", s.handleHermesCredentials)
 		mux.HandleFunc("POST /api/agents/{id}/forget", s.handleHermesForget)
