@@ -1,6 +1,10 @@
 {{- if .Values.preflight.enabled }}
 {{- $tHost := (split ":" .Values.temporal.hostPort)._0 }}
 {{- $tPort := (split ":" .Values.temporal.hostPort)._1 }}
+{{- $routerNodeSelector := list }}
+{{- range $key, $value := .Values.router.nodeSelector }}
+{{- $routerNodeSelector = append $routerNodeSelector (printf "%s=%s" $key $value) }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -19,15 +23,18 @@ metadata:
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
     argocd.argoproj.io/hook-weight: "-5"
 rules:
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["get"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -82,11 +89,8 @@ spec:
         {{- if .Values.monitoring.enabled }}
         - name: monitoring-api-check
           image: {{ .Values.preflight.kubectlImage }}
-          command: ["sh", "-ceu"]
-          args:
-            - >-
-              kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null &&
-              kubectl get --raw /apis/monitoring.coreos.com/v1 >/dev/null
+          command: ["kubectl"]
+          args: ["get", "--raw", "/apis/monitoring.coreos.com/v1"]
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}
@@ -98,6 +102,41 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 64Mi}
+        - name: traefik-api-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command: ["kubectl"]
+          args: ["get", "--raw", "/apis/traefik.io/v1alpha1"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        - name: router-node-check
+          image: {{ .Values.preflight.kubectlImage }}
+          command: ["kubectl"]
+          args: ["wait", "nodes", {{ printf "--selector=%s" (join "," $routerNodeSelector) | quote }}, "--for=condition=Ready", "--timeout=30s"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+        - name: node-port-check
+          image: {{ .Values.preflight.busyboxImage }}
+          command: ["sh", "-ceu"]
+          args:
+            - |
+              api="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}"
+              get_kubernetes_api() {
+                wget -qO- --ca-certificate=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+                  --header="Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" "$api$1"
+              }
+              if service="$(get_kubernetes_api /api/v1/namespaces/{{ .Release.Namespace }}/services/hermes-api-router)"; then
+                printf '%s' "$service" | grep -Eq '"type":[[:space:]]*"NodePort"'
+                printf '%s' "$service" | grep -Eq '"nodePort":[[:space:]]*{{ .Values.router.nodePort }}([,}])'
+                printf '%s' "$service" | grep -Eq '"externalTrafficPolicy":[[:space:]]*"Local"'
+              else
+                services="$(get_kubernetes_api /api/v1/services)"
+                ! printf '%s' "$services" | grep -Eq '"nodePort":[[:space:]]*{{ .Values.router.nodePort }}([,}])'
+              fi
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
         - name: api-secret-check
           image: {{ .Values.preflight.busyboxImage }}
           command: ["sh", "-c"]

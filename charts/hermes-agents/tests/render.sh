@@ -21,6 +21,7 @@ helm template hermes-agents "$chart" --namespace hermes-agents \
 	--set-string router.hostname=homelab-server.example.ts.net \
 	--set-string backup.repository=sftp:user@nas:/repo \
 	--set-string backup.maintenance.schedule='30 6 * * *' \
+	--set-string router.nodeSelector.workload=hermes \
 	--set-string 'hermes.gitAllowedHosts[0]=github.com' \
 	--set-string 'hermes.gitAllowedHosts[1]=gitlab.com' >"$rendered_custom"
 helm template hermes-agents "$chart" --namespace hermes-agents \
@@ -44,12 +45,20 @@ assert_not_rendered() {
   fi
 }
 
+assert_images_pinned() {
+  if grep -E '^[[:space:]]+image: ' "$1" | grep -vF '@sha256:'; then
+    echo "rendered image is not pinned by digest" >&2
+    return 1
+  fi
+}
+
 assert_rendered 'value: hermes'
 assert_rendered 'app: hermes-agent'
 assert_rendered 'port: 9119'
 assert_rendered 'port: 8642'
 assert_rendered 'docker.io/nousresearch/hermes-agent:v2026.7.7.2@sha256:3db34ce19adfa080736a2a3feb0316dbcccc588faa9afe7fd8ae1c03b4f1a53a'
 assert_rendered '/apis/agents.x-k8s.io/v1beta1'
+assert_rendered '/apis/traefik.io/v1alpha1'
 assert_rendered 'resources: ["pods"]'
 assert_rendered 'resources: ["pods/log"]'
 assert_rendered 'command: ["kubectl"]'
@@ -61,8 +70,8 @@ assert_rendered 'name: hermes-landing'
 assert_rendered 'value: "hermes"'
 assert_rendered 'host: "agents.example.test"'
 assert_rendered 'path: /healthz'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.9.0'
-assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-landing:0.9.0@sha256:1e7d4a164d3f04b1c7796050dbfca3b646ed25d5befda982a5936d5aa1b9d0bf'
+assert_rendered 'image: ghcr.io/veelabs/dev-environments-provisioner:0.10.0@sha256:416fe0ee177c7acf5a16d922f646bf933df35b22d7b8c522b960028d4c29c5c6'
 assert_rendered 'verbs: ["get", "list"]'
 assert_rendered 'verbs: ["get", "list", "watch", "create", "delete", "update"]'
 assert_rendered 'resources: ["persistentvolumeclaims"]'
@@ -111,8 +120,11 @@ assert_rendered 'kube_cronjob_status_last_successful_time'
 assert_rendered 'kube_cronjob_created'
 assert_rendered '26 * 3600'
 assert_rendered 'unless on(namespace, cronjob)'
-assert_rendered 'prometheusrules.monitoring.coreos.com'
 assert_rendered '/apis/monitoring.coreos.com/v1'
+assert_rendered 'args: ["get", "--raw", "/apis/monitoring.coreos.com/v1"]'
+assert_rendered 'args: ["get", "--raw", "/apis/traefik.io/v1alpha1"]'
+assert_rendered 'args: ["wait", "nodes", "--selector=node-role.kubernetes.io/control-plane=true", "--for=condition=Ready", "--timeout=30s"]'
+assert_rendered 'args: ["wait", "nodes", "--selector=node-role.kubernetes.io/control-plane=true,workload=hermes", "--for=condition=Ready", "--timeout=30s"]' "$rendered_custom"
 assert_not_rendered 'kind: PrometheusRule' "$rendered_no_monitoring"
-assert_not_rendered 'prometheusrules.monitoring.coreos.com' "$rendered_no_monitoring"
 assert_not_rendered '/apis/monitoring.coreos.com/v1' "$rendered_no_monitoring"
+assert_images_pinned "$rendered"

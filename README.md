@@ -87,6 +87,9 @@ DeleteData takes a final verified backup before removing the PVC; the retained
 entity can then restore a selected agent-scoped NAS snapshot into a fresh PVC
 before starting and health-checking Hermes.
 
+Hermes creation, credentials, API, lifecycle, backup, restore, and recovery:
+[`docs/hermes-runbook.md`](docs/hermes-runbook.md).
+
 ## Layout
 
 | Path | What |
@@ -101,7 +104,7 @@ before starting and health-checking Hermes.
 
 ## Versions
 
-Images are pinned by tag in `values.yaml`; CI (`.github/workflows/images.yaml`)
+Images are pinned by stable tag and digest in `values.yaml`; CI (`.github/workflows/images.yaml`)
 builds `dev-environments-sandbox:<opencode>-<openchamber>`,
 `dev-environments-provisioner:<appVersion>`, and
 `dev-environments-landing:<appVersion>` on change.
