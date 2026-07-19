@@ -60,24 +60,19 @@ type Activities struct {
 	dyn     dynamic.Interface
 	kube    kubernetes.Interface
 	httpDo  func(*http.Request) (*http.Response, error)
-	podLogs func(context.Context, string, string, string) ([]byte, error)
 	nowFunc func() time.Time
 }
 
 // New wires the activity implementations.
 func New(cfg config.Config, dyn dynamic.Interface, kube kubernetes.Interface) *Activities {
 	httpClient := &http.Client{Timeout: 15 * time.Second}
-	a := &Activities{
+	return &Activities{
 		cfg:     cfg,
 		dyn:     dyn,
 		kube:    kube,
 		httpDo:  httpClient.Do,
 		nowFunc: time.Now,
 	}
-	a.podLogs = func(ctx context.Context, namespace, pod, container string) ([]byte, error) {
-		return kube.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Container: container}).DoRaw(ctx)
-	}
-	return a
 }
 
 // CreateSandboxClaimInput identifies the claim to create.

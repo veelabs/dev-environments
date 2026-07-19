@@ -153,12 +153,6 @@ No LLM keys are injected. Each user authenticates inside their environment
 (OpenChamber terminal → `opencode auth login`). Credentials live in the pod's
 ephemeral filesystem and die with the TTL — by design.
 
-## Hermes backup operations
-
-See [`hermes-runbook.md`](hermes-runbook.md) for Hermes creation, credentials,
-private API clients, complete lifecycle semantics, image upgrades, capacity,
-backup monitoring, restore, cancellation, termination, and Forget.
-
 ## One-time edge setup (DR checklist)
 
 1. Tunnel public hostname `*.renala.dev` → `http://traefik.kube-system:80`.
