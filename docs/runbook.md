@@ -195,6 +195,42 @@ write/delete identity. Host and tag filters prevent accidental cross-retention,
 not malicious access. A compromised client can read or delete every recovery
 point in the repository.
 
+## Hermes data deletion and restore
+
+Use the agent card on `agents.<baseDomain>` for the normal recovery lifecycle:
+
+1. **Delete data** requires typing the full `agent-...` identity. The workflow
+   stops runtime, creates and verifies a final Hermes/restic backup, then removes
+   the PVC and its backup schedule. The Temporal entity, generated dashboard
+   credentials, and NAS snapshots remain in `backup-only` state.
+2. If the final backup fails, deletion is blocked. Fix the reported NAS/archive
+   problem and retry. **Force delete data** appears only after that failure and
+   requires typing the full identity again; use it only when losing changes
+   newer than the last successful snapshot is acceptable.
+3. In `backup-only`, choose a restore point by timestamp and full snapshot ID.
+   The newest point is selected by default. Restore creates a fresh `5Gi` PVC,
+   downloads that exact agent snapshot, validates the ZIP and SQLite databases,
+   and runs native `hermes import` before any Sandbox is created.
+4. A successful import starts the current pinned runtime and verifies both the
+   dashboard and API. A failed download, validation, or import removes partial
+   PVC data, leaves the source snapshot untouched, and keeps Restore retryable.
+
+Start and Backup are intentionally unavailable without a PVC. Stop remains a
+no-op in `backup-only`; Forget remains available and removes only the catalog
+entity and generated dashboard credentials, never NAS snapshots.
+
+Inspect a failed recovery without exposing repository credentials:
+
+```sh
+kubectl -n hermes-agents get jobs,pods,pvc -l renala.dev/agent-id=agent-calm-fox
+kubectl -n hermes-agents describe job -l renala.dev/agent-id=agent-calm-fox
+kubectl -n hermes-agents logs job/hermes-restore-<hash> -c restore
+kubectl -n hermes-agents logs job/hermes-restore-<hash> -c import
+```
+
+Repository credentials are mounted only into worker-created restic containers.
+The landing API and Temporal status contain only snapshot IDs and timestamps.
+
 ## One-time edge setup (DR checklist)
 
 1. Tunnel public hostname `*.renala.dev` → `http://traefik.kube-system:80`.
