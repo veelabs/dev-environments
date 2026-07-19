@@ -2,10 +2,8 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
-	"time"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -48,26 +46,13 @@ func main() {
 	}
 	defer tc.Close()
 
-	a := activities.New(cfg, dyn, kube)
-	if cfg.WorkerKind == "hermes" {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		err = a.ReconcileHermesBackupSchedules(ctx)
-		cancel()
-		if err != nil {
-			log.Fatalf("reconcile Hermes backup schedules: %v", err)
-		}
-	}
 	w := worker.New(tc, cfg.TaskQueue, worker.Options{})
-	if cfg.WorkerKind == "hermes" {
-		w.RegisterWorkflow(wf.ProvisionHermesAgent)
-	} else {
-		w.RegisterWorkflow(wf.ProvisionDevEnvironment)
-		w.RegisterWorkflow(wf.DeprovisionDevEnvironment)
-	}
-	w.RegisterActivity(a)
+	w.RegisterWorkflow(wf.ProvisionDevEnvironment)
+	w.RegisterWorkflow(wf.DeprovisionDevEnvironment)
+	w.RegisterActivity(activities.New(cfg, dyn, kube))
 
-	log.Printf("provisioner worker starting: kind=%s queue=%s namespace=%s sandboxNS=%s",
-		cfg.WorkerKind, cfg.TaskQueue, cfg.TemporalNamespace, cfg.SandboxNamespace)
+	log.Printf("provisioner worker starting: queue=%s namespace=%s sandboxNS=%s template=%s",
+		cfg.TaskQueue, cfg.TemporalNamespace, cfg.SandboxNamespace, cfg.SandboxTemplate)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker: %v", err)
 	}

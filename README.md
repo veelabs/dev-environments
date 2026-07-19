@@ -75,27 +75,11 @@ temporal workflow cancel --workflow-id ...                  # early teardown
 
 Full operational guide: [`docs/runbook.md`](docs/runbook.md).
 
-## Persistent Hermes agents
-
-The independent `charts/hermes-agents` release serves the Access-gated operator
-page at `agents.<baseDomain>`. It creates and lists durable Temporal entities,
-streams their current phase by polling, starts and stops retained runtimes, and
-reveals or rotates generated dashboard credentials. Stop removes the Sandbox,
-Service, and Ingress while retaining the workflow, `5Gi` PVC, Secret, and Hermes
-home. Literal Temporal cancellation remains the emergency runtime cleanup path.
-DeleteData takes a final verified backup before removing the PVC; the retained
-entity can then restore a selected agent-scoped NAS snapshot into a fresh PVC
-before starting and health-checking Hermes.
-
-Hermes creation, credentials, API, lifecycle, backup, restore, and recovery:
-[`docs/hermes-runbook.md`](docs/hermes-runbook.md).
-
 ## Layout
 
 | Path | What |
 |---|---|
 | `charts/dev-environments/` | Helm chart (the deployable) |
-| `charts/hermes-agents/` | Independent persistent Hermes agent chart |
 | `provisioner/` | Go module: Temporal worker (workflows + k8s activities) and landing server |
 | `images/sandbox/` | OpenCode + OpenChamber sandbox image |
 | `images/provisioner/` | worker image |
@@ -104,7 +88,7 @@ Hermes creation, credentials, API, lifecycle, backup, restore, and recovery:
 
 ## Versions
 
-Images are pinned by stable tag and digest in `values.yaml`; CI (`.github/workflows/images.yaml`)
+Images are pinned by tag in `values.yaml`; CI (`.github/workflows/images.yaml`)
 builds `dev-environments-sandbox:<opencode>-<openchamber>`,
 `dev-environments-provisioner:<appVersion>`, and
 `dev-environments-landing:<appVersion>` on change.
